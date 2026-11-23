@@ -1,0 +1,104 @@
+/*
+ * Copyright 2025-2026 Hancom Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.opendataloader.pdf.api;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import org.opendataloader.pdf.hybrid.ElementMetadata;
+import org.opendataloader.pdf.processors.DocumentProcessor;
+import org.verapdf.pd.PDDocument;
+
+import java.io.IOException;
+import java.util.Collections;
+import java.util.Map;
+
+/**
+ * Result of {@link AutoTagger#tag}. Contains the tagged PDF document in-memory
+ * and processing timing metadata.
+ *
+ * <p>Implements {@link AutoCloseable} for use with try-with-resources.
+ * The caller is responsible for closing this result, which releases the
+ * underlying PDDocument resources.
+ */
+public class TaggingResult implements AutoCloseable {
+
+    private final PDDocument document;
+    private final long extractionNs;
+    private final long taggingNs;
+    private final JsonNode hybridTimings;
+    private final Map<Long, ElementMetadata> elementMetadata;
+
+    public TaggingResult(PDDocument document, long extractionNs, long taggingNs,
+                          JsonNode hybridTimings, Map<Long, ElementMetadata> elementMetadata) {
+        if (document == null) {
+            throw new IllegalArgumentException("document must not be null");
+        }
+        this.document = document;
+        this.extractionNs = extractionNs;
+        this.taggingNs = taggingNs;
+        this.hybridTimings = hybridTimings;
+        this.elementMetadata = elementMetadata != null ? elementMetadata : Collections.emptyMap();
+    }
+
+    public TaggingResult(PDDocument document, long extractionNs, long taggingNs, JsonNode hybridTimings) {
+        this(document, extractionNs, taggingNs, hybridTimings, Collections.emptyMap());
+    }
+
+    /** The tagged PDF document. Do not close this directly — close the TaggingResult instead. */
+    public PDDocument getDocument() {
+        return document;
+    }
+
+    /** Time spent on extraction (parsing + layout + content extraction) in nanoseconds. */
+    public long getExtractionNs() {
+        return extractionNs;
+    }
+
+    /** Time spent on auto-tagging (structure tree creation) in nanoseconds. */
+    public long getTaggingNs() {
+        return taggingNs;
+    }
+
+    /** Per-step hybrid server timings, or null if hybrid mode was not used. */
+    public JsonNode getHybridTimings() {
+        return hybridTimings;
+    }
+
+    /** Element metadata from hybrid backend, or empty map if not available. */
+    public Map<Long, ElementMetadata> getElementMetadata() {
+        return elementMetadata;
+    }
+
+    /**
+     * Save the tagged PDF to a file.
+     *
+     * @param outputPath the output file path
+     */
+    public void saveTo(String outputPath) throws IOException {
+        document.saveAs(outputPath);
+    }
+
+    /**
+     * Closes the tagged document. While another document is current on this thread, such as the
+     * document of a later extraction, the tagged document is closed on a new thread, so the
+     * current document keeps its state.
+     */
+    @Override
+    public void close() {
+        if (document != null) {
+            DocumentProcessor.closeDocument(document);
+        }
+    }
+}

